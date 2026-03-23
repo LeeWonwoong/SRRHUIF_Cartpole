@@ -74,7 +74,7 @@ class Config:
     env_name: str = "CartPole-v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
-    max_episodes: int = 300
+    max_episodes: int = 200
     max_steps: int = 500
     batch_size: int = 128      
     buffer_size: int = 100000
@@ -91,7 +91,7 @@ class Config:
     
     tau_fv: float = 0.005
     tau_ld: float = 0.005
-    tau_nd: float = 0.015
+    tau_nd: float = 0.005
     
     exploration: str = "epsilon_greedy"
     eps_start: float = 0.99
@@ -100,14 +100,14 @@ class Config:
     exploration_scale: float = 3.0
     
     N_horizon: int = 5  
-    q_std: float = 1e-3
+    q_std: float = 5e-3
     r_std_fv: float = 2.9
     r_std_ld: float = 3 
-    r_std_nd: float = 2.2
+    r_std_nd: float = 2
     ld_global_denom: bool = False   
     nd_global_denom: bool = False   
     
-    update_interval: int = 4   # 몇 step마다 SRRHUIF 업데이트할지
+    update_interval: int = 1   # 몇 step마다 SRRHUIF 업데이트할지
 
     alpha: float = 0.99
     beta: float = 2.0
@@ -550,10 +550,23 @@ def srrhuif_step_full_vector(theta_current, theta_target, S_info, batch, sp, is_
     
     s_next = batch['s_next'].t()
     if sp.get('normalizer'): s_next = sp['normalizer'].normalize(s_next)
+    """
     thetas_pair = torch.stack([theta_current.squeeze(), theta_target.squeeze()], dim=0)
     Q_both_f32 = forward_bmm(thetas_pair, info, s_next)                      # ★ FP32
     a_best_next = Q_both_f32[0].argmax(dim=0)
     q_val_next = Q_both_f32[1][a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)  # ★ → FP64
+    """
+    
+    # ── DDQN Target ──
+    if is_first:
+        Q_tgt_f32 = forward_bmm(theta_target.squeeze().unsqueeze(0), info, s_next)
+        q_val_next = Q_tgt_f32[0].max(dim=0).values.to(DTYPE)
+    else:
+        thetas_pair = torch.stack([theta_current.squeeze(), theta_target.squeeze()], dim=0)
+        Q_both_f32 = forward_bmm(thetas_pair, info, s_next)
+        a_best_next = Q_both_f32[0].argmax(dim=0)
+        q_val_next = Q_both_f32[1][a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)
+    
     z_measured = (batch['r'] + cfg.gamma * (1 - batch['term']) * q_val_next).view(-1, 1)
     
     residual = z_measured - z_hat
@@ -648,10 +661,21 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp, is
         s_next = sp['normalizer'].normalize(s_next)
     
     # ── DDQN Target ──
+    """
     thetas_pair = torch.stack([theta_current.squeeze(), theta_target.squeeze()], dim=0)
     Q_both_f32 = forward_bmm(thetas_pair, info, s_next)                      # ★ FP32
     a_best_next = Q_both_f32[0].argmax(dim=0)
     q_val_next = Q_both_f32[1][a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)  # → FP64
+    """
+    if is_first:
+        Q_tgt_f32 = forward_bmm(theta_target.squeeze().unsqueeze(0), info, s_next) # 첫스탭에서 target 값은 Target_Q_network로만 계산 (Standard DQN)
+        q_val_next = Q_tgt_f32[0].max(dim=0).values.to(DTYPE)
+    else:
+        thetas_pair = torch.stack([theta_current.squeeze(), theta_target.squeeze()], dim=0) 
+        Q_both_f32 = forward_bmm(thetas_pair, info, s_next)
+        a_best_next = Q_both_f32[0].argmax(dim=0) # 이후 action은 이전 스탭에서 추정한 Theta_current로 계산 (DDQN)
+        q_val_next = Q_both_f32[1][a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)
+
     z_measured = (batch['r'] + cfg.gamma * (1 - batch['term']) * q_val_next).view(-1, 1)
     
     # =====================================================================
