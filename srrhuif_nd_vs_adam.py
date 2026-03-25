@@ -31,8 +31,8 @@ print("=" * 70)
 print(f"SRRHUIF-D3QN v4 (ND + SPAS + Adam) | PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"Device: {torch.cuda.get_device_name(0)}")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = True
 print("=" * 70)
 
@@ -47,7 +47,7 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float64)
 DTYPE = torch.float64
 DTYPE_FWD = torch.float32
-JITTER = 1e-6
+JITTER = 1e-14
 
 # =========================================================================
 # 1. Configuration
@@ -73,18 +73,19 @@ class Config:
     tau_srrhuif: float = 0.005
     N_horizon: int = 5
     q_std: float = 5e-3
-    r_std: float = 2.0
+    r_std: float = 1.7
+
     alpha: float = 0.99
     beta: float = 2.0
     kappa: float = 0.0
     p_init_min: float = 0.001
-    p_init_max: float = 0.01
+    p_init_max: float = 0.016
     adaptive_window: int = 15
     use_spas: bool = True   # ★ Sigma Point Action Selection
 
     # --- Adam D3QN params ---
     tau_adam: float = 0.005
-    adam_lr: float = 1e-3
+    adam_lr: float = 5e-4
 
     # --- Exploration ---
     eps_start: float = 0.99
@@ -304,7 +305,6 @@ def tria_operation_batch(A):
     d = torch.diagonal(s, dim1=-2, dim2=-1)
     signs = torch.where(d >= 0, torch.ones_like(d), -torch.ones_like(d))
     s = s * signs.unsqueeze(-1)
-    s.diagonal(dim1=-2, dim2=-1).clamp_(min=1e-6)
     return s
 
 def safe_inv_tril_batch(L_batch, eye_batch):
@@ -676,7 +676,7 @@ def train_srrhuif_nd():
                     a = forward_single(theta.squeeze(), info, s_t).squeeze().argmax().item()
 
             ns, r, done, trunc, _ = env.step(a)
-            buffer.push(s, a, r / cfg.scale_factor, ns, done or trunc)
+            buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
             if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
@@ -724,6 +724,7 @@ def train_adam():
     target_net.eval()
 
     optimizer = torch.optim.Adam(policy_net.parameters(), lr=cfg.adam_lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
     normalizer = InputNormalizer(device) if cfg.use_input_norm else None
     buffer = TensorReplayBuffer(cfg.buffer_size, dimS, device)
     logger = LivePlotter("Adam D3QN", cfg.max_episodes)
@@ -776,7 +777,8 @@ def train_adam():
                         t_p.data.copy_(cfg.tau_adam * p.data + (1 - cfg.tau_adam) * t_p.data)
 
             if done or trunc: break
-
+            
+        scheduler.step()
         avg_l = np.mean(ep_l) if ep_l else 0
         logger.add(ep_r, avg_l)
         if ep % cfg.plot_interval == 0:
@@ -795,15 +797,15 @@ def train_adam():
 # =========================================================================
 # 11. Comparison Plot
 # =========================================================================
-def plot_comparison(srrhuif_log: TrainingLogger, adam_log: TrainingLogger):
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+def plot_comparison(srrhuif_log: LivePlotter, adam_log: LivePlotter):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     ma_window = 20
     spas_str = "SPAS" if cfg.use_spas else "StdDQN"
     fig.suptitle(f"SRRHUIF-ND ({spas_str}) vs Adam D3QN | "
                  f"R={cfg.r_std} Q={cfg.q_std} γ={cfg.gamma}", fontsize=14)
 
     # Row 1: Rewards
-    ax = axes[0, 0]
+    ax = axes[0]
     ax.plot(srrhuif_log.rewards, 'b-', alpha=0.2, label='SRRHUIF raw')
     ax.plot(adam_log.rewards, 'r-', alpha=0.2, label='Adam raw')
     if len(srrhuif_log.rewards) >= ma_window:
@@ -816,37 +818,13 @@ def plot_comparison(srrhuif_log: TrainingLogger, adam_log: TrainingLogger):
     ax.set_title('Episode Reward'); ax.legend(fontsize=8)
 
     # Row 1: Loss
-    ax = axes[0, 1]
+    ax = axes[1]
     ax.plot(srrhuif_log.losses, 'b-', alpha=0.7, label='SRRHUIF')
     ax.plot(adam_log.losses, 'r-', alpha=0.7, label='Adam')
-    ax.set_title('TD Loss'); ax.legend(); ax.set_yscale('log')
-
-    # Row 1: P_init (SRRHUIF only)
-    ax = axes[0, 2]
-    ax.plot(srrhuif_log.p_inits, 'g-', linewidth=2)
-    ax.set_title('Adaptive P_init (SRRHUIF)'); ax.set_ylim(0, cfg.p_init_max * 1.2)
-
-    # Row 2: Cumulative reward
-    ax = axes[1, 0]
-    cum_s = np.cumsum(srrhuif_log.rewards)
-    cum_a = np.cumsum(adam_log.rewards)
-    ax.plot(cum_s, 'b-', linewidth=2, label='SRRHUIF')
-    ax.plot(cum_a, 'r-', linewidth=2, label='Adam')
-    ax.set_title('Cumulative Reward'); ax.legend()
-
-    # Row 2: Rolling average (last 50)
-    ax = axes[1, 1]
-    win = 50
-    if len(srrhuif_log.rewards) >= win:
-        roll_s = [np.mean(srrhuif_log.rewards[max(0, i - win):i + 1]) for i in range(len(srrhuif_log.rewards))]
-        roll_a = [np.mean(adam_log.rewards[max(0, i - win):i + 1]) for i in range(len(adam_log.rewards))]
-        ax.plot(roll_s, 'b-', linewidth=2, label='SRRHUIF')
-        ax.plot(roll_a, 'r-', linewidth=2, label='Adam')
-    ax.axhline(y=195, color='g', linestyle='--', alpha=0.5)
-    ax.set_title(f'Rolling Average (win={win})'); ax.legend()
-
+    ax.set_title('TD Loss'); ax.legend()
+    
     # Row 2: Summary stats
-    ax = axes[1, 2]
+    ax = axes[2]
     ax.axis('off')
     last50_s = np.mean(srrhuif_log.rewards[-50:]) if len(srrhuif_log.rewards) >= 50 else np.mean(srrhuif_log.rewards)
     last50_a = np.mean(adam_log.rewards[-50:]) if len(adam_log.rewards) >= 50 else np.mean(adam_log.rewards)

@@ -18,10 +18,6 @@ matplotlib.use('Agg')
 =========================================================================
 SRRHUIF-D3QN v3: Mixed Precision (A+B+C+D+E)
 =========================================================================
-  기존 (A~D 유지):
-    [A] Compile-Safe Math   [B] NDCache Pre-compute
-    [C] torch.compile       [D] Unified Forward (1회 forward_bmm)
-
   ★ [E] 3-Tier Mixed Precision:
     ┌─────────────────────────────────────────────────────────────┐
     │ Tier 1 — FP32 (Forward Zone)                                │
@@ -48,8 +44,8 @@ print(f"SRRHUIF-D3QN v3 (Mixed Precision) | PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     # ★ [E] TF32 활성화: FP32 matmul에 텐서코어 활용
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.backends.cudnn.benchmark = True
 print("="*70)
 
@@ -63,8 +59,8 @@ def set_all_seeds(seed: int):
 
 torch.set_default_dtype(torch.float64)
 DTYPE = torch.float64
-DTYPE_FWD = torch.float32  # ★ [E] Forward zone precision
-JITTER = 1e-6
+DTYPE_FWD = torch.float64 # ★ [E] Forward zone precision
+JITTER = 1e-12
 
 # =========================================================================
 # 1. Configuration
@@ -83,7 +79,7 @@ class Config:
     value_layers: List[int] = field(default_factory=lambda: [4])
     advantage_layers: List[int] = field(default_factory=lambda: [4])
     
-    gamma: float = 0.94     
+    gamma: float = 0.9    
     
     scale_factor_fv: float = 1.0
     scale_factor_ld: float = 1.0
@@ -94,14 +90,14 @@ class Config:
     tau_nd: float = 0.005
     
     exploration: str = "epsilon_greedy"
-    eps_start: float = 0.99
+    eps_start: float = 0.9
     eps_end: float = 0.001
     eps_decay_steps: int = 3000
-    exploration_scale: float = 3.0
+    exploration_scale: float = 0.2
     
-    N_horizon: int = 5  
+    N_horizon: int = 5
     q_std: float = 5e-3
-    r_std_fv: float = 2.9
+    r_std_fv: float = 2.5
     r_std_ld: float = 3 
     r_std_nd: float = 2
     ld_global_denom: bool = False   
@@ -109,12 +105,12 @@ class Config:
     
     update_interval: int = 1   # 몇 step마다 SRRHUIF 업데이트할지
 
-    alpha: float = 0.99
+    alpha: float = 0.9
     beta: float = 2.0
     kappa: float = 0.0
     
-    p_init_min: float = 0.001
-    p_init_max: float = 0.01
+    p_init_min: float = 0.01
+    p_init_max: float = 0.2
     adaptive_window: int = 15
     
     use_input_norm: bool = True
@@ -353,14 +349,16 @@ def tria_operation(A):
     _, r = torch.linalg.qr(A.t())
     s = r.t(); d = torch.diag(s)
     signs = torch.where(d >= 0, torch.ones_like(d), -torch.ones_like(d))
-    s = s * signs; s.diagonal().clamp_(min=1e-6); return s
+    s = s * signs; 
+    return s
 
 def tria_operation_batch(A):
     _, r = torch.linalg.qr(A.transpose(-2, -1).contiguous())
     s = r.transpose(-2, -1).contiguous()
     d = torch.diagonal(s, dim1=-2, dim2=-1)
     signs = torch.where(d >= 0, torch.ones_like(d), -torch.ones_like(d))
-    s = s * signs.unsqueeze(-1); s.diagonal(dim1=-2, dim2=-1).clamp_(min=1e-6); return s
+    s = s * signs.unsqueeze(-1)
+    return s
 
 def safe_inv_tril(L, n, device):
     eye = torch.eye(n, dtype=L.dtype, device=device)
@@ -489,14 +487,53 @@ def ts_sample_theta_ld(theta, layer_S_inv_t_cached, ts_temperature, exploration_
     return theta_explored
 
 def ts_sample_theta_nd(theta, neuron_S_inv_t_cached, ts_temperature, exploration_scale, info, nd_cache, device):
+    """
+    [Ultimate TS] Factorized Noise + Head-Only Strategy
+    1. Shared 레이어는 노이즈 없이 원본 유지 (나비효과 방지)
+    2. Value/Advantage 레이어는 Factorized(랭크 제한) 노이즈 생성
+    3. SRRHUIF의 공분산(S_inv_t)을 거쳐 파라미터 맞춤형 탐색 수행
+    """
     theta_explored = theta.squeeze().clone()
+    
+    # NoisyNet 스케일링 함수: 난수의 분산이 너무 커지는 것을 제어
+    def f(x):
+        return torch.sign(x) * torch.sqrt(torch.abs(x))
+    
     for L in range(info['num_nd_layers']):
         nd_layer = info['nd_layers'][L]
+        
+        # 1. Head-Only Strategy: 특징 추출기(Shared)는 탐색 노이즈를 주지 않음
+        if nd_layer['type'] == 'shared':
+            continue
+            
         lc = nd_cache.get(L)
-        w_batch = torch.randn(lc['fan_out'], lc['n_per'], 1, dtype=DTYPE, device=device)
-        noise = ts_temperature * exploration_scale * torch.bmm(neuron_S_inv_t_cached[L], w_batch)
-        theta_explored[nd_layer['W_start']:nd_layer['W_start']+nd_layer['W_len']] += noise[:, :lc['fan_in'], 0].reshape(-1)
-        theta_explored[nd_layer['b_start']:nd_layer['b_start']+nd_layer['b_len']] += noise[:, lc['fan_in'], 0]
+        fan_in = lc['fan_in']
+        fan_out = lc['fan_out']
+        
+        # 2. Factorized Noise: 입력과 출력 차원에 대해 각각 독립 난수 생성
+        eps_in = torch.randn(fan_in, device=device, dtype=DTYPE)
+        eps_out = torch.randn(fan_out, device=device, dtype=DTYPE)
+        
+        f_in = f(eps_in)
+        f_out = f(eps_out)
+        
+        # 외적(Outer Product)을 통한 가중치(W) 노이즈 기본형: [fan_out, fan_in]
+        W_noise_base = f_out.unsqueeze(1) @ f_in.unsqueeze(0) 
+        
+        # 편향(b) 노이즈 기본형: [fan_out, 1]
+        b_noise_base = f_out.unsqueeze(1)
+        
+        # SRRHUIF BMM 연산을 위한 형태 맞추기: [fan_out, n_per, 1]
+        w_batch_factorized = torch.cat([W_noise_base, b_noise_base], dim=1).unsqueeze(2)
+        
+        # 3. SRRHUIF 공분산 행렬 적용 및 스케일링
+        # 안전하게 제어된 w_batch_factorized를 S_inv_t 에 통과시켜 불확실성 방향 부여
+        noise = ts_temperature * exploration_scale * torch.bmm(neuron_S_inv_t_cached[L], w_batch_factorized)
+        
+        # 4. 파라미터 업데이트
+        theta_explored[nd_layer['W_start']:nd_layer['W_start']+nd_layer['W_len']] += noise[:, :fan_in, 0].reshape(-1)
+        theta_explored[nd_layer['b_start']:nd_layer['b_start']+nd_layer['b_len']] += noise[:, fan_in, 0]
+        
     return theta_explored
 
 def initialize_theta(info, device):
@@ -844,7 +881,7 @@ def train(method: str):
     if method == 'full_vector': S_info = None
     elif method == 'layer_decoupled': layer_S_info = [None] * info['num_ld_layers']
     elif method == 'node_decoupled':
-        neuron_S_info = [1e-6 * nd_cache.get(L)['eye_n_per'].unsqueeze(-1).expand(-1, -1, nd['fan_out']).clone() for L, nd in enumerate(info['nd_layers'])]
+        neuron_S_info = [1e-10 * nd_cache.get(L)['eye_n_per'].unsqueeze(-1).expand(-1, -1, nd['fan_out']).clone() for L, nd in enumerate(info['nd_layers'])]
     
     if cfg.exploration == 'thompson_sampling':
         if method == 'full_vector':
@@ -876,28 +913,40 @@ def train(method: str):
         p_init = cfg.p_init_min + (cfg.p_init_max - cfg.p_init_min) * gap
         ts_temperature = np.sqrt(p_init)
         
+        # ====================================================================
+        # [변경 핵심] TS 노이즈 샘플링을 에피소드 시작 시 단 1회만 수행
+        # ====================================================================
+        if cfg.exploration == 'thompson_sampling':
+            with torch.no_grad():
+                if method == 'full_vector': 
+                    theta_explored = ts_sample_theta_fv(theta, S_inv_t_cached, ts_temperature, cfg.exploration_scale, n_x, cfg.device)
+                elif method == 'layer_decoupled': 
+                    theta_explored = ts_sample_theta_ld(theta, layer_S_inv_t_cached, ts_temperature, cfg.exploration_scale, info, cfg.device)
+                elif method == 'node_decoupled': 
+                    theta_explored = ts_sample_theta_nd(theta, neuron_S_inv_t_cached, ts_temperature, cfg.exploration_scale, info, nd_cache, cfg.device)
+        
         for t in range(cfg.max_steps):
             steps_done += 1
             if cfg.exploration == 'epsilon_greedy':
                 eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-steps_done / cfg.eps_decay_steps)
-                if np.random.rand() < eps: a = env.action_space.sample()
+                if np.random.rand() < eps: 
+                    a = env.action_space.sample()
                 else:
                     with torch.no_grad():
-                        s_t_buffer.copy_(torch.as_tensor(s, dtype=DTYPE))  # CPU 텐서 생성 후 GPU buffer에 copy
+                        s_t_buffer.copy_(torch.as_tensor(s, dtype=DTYPE)) 
                         s_t = s_t_buffer
                         if normalizer: s_t = normalizer.normalize(s_t)
                         a = forward_single(theta.squeeze(), info, s_t).squeeze().argmax().item()
+            
             elif cfg.exploration == 'thompson_sampling':
                 with torch.no_grad():
-                    if method == 'full_vector': theta_explored = ts_sample_theta_fv(theta, S_inv_t_cached, ts_temperature, cfg.exploration_scale, n_x, cfg.device)
-                    elif method == 'layer_decoupled': theta_explored = ts_sample_theta_ld(theta, layer_S_inv_t_cached, ts_temperature, cfg.exploration_scale, info, cfg.device)
-                    elif method == 'node_decoupled': theta_explored = ts_sample_theta_nd(theta, neuron_S_inv_t_cached, ts_temperature, cfg.exploration_scale, info, nd_cache, cfg.device)
+                    # 매 타임스텝마다 파라미터를 흔들지 않고, 에피소드 시작 시 만든 theta_explored를 계속 사용
                     s_t = torch.tensor(s, dtype=DTYPE, device=cfg.device)
                     if normalizer: s_t = normalizer.normalize(s_t)
                     a = forward_single(theta_explored, info, s_t).squeeze().argmax().item()
             
             ns, r, done, trunc, _ = env.step(a)
-            buffer.push(s, a, r / scale_factor, ns, done or trunc)
+            buffer.push(s, a, r / scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
             
             if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
@@ -947,4 +996,5 @@ def compare():
     plt.tight_layout(); plt.savefig('srrhuif_comparison_v3.png'); plt.show()
 
 if __name__ == "__main__":
-    train('node_decoupled')
+    #train('node_decoupled')
+    train('full_vector')
