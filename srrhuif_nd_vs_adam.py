@@ -11,6 +11,8 @@ from typing import List, Dict, Tuple, Optional
 import time
 import os
 import random
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 matplotlib.use('Agg')
 
@@ -31,8 +33,8 @@ print("=" * 70)
 print(f"SRRHUIF-D3QN v4 (ND + SPAS + Adam) | PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"Device: {torch.cuda.get_device_name(0)}")
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 print("=" * 70)
 
@@ -60,7 +62,7 @@ class Config:
     max_episodes: int = 200
     max_steps: int = 500
     batch_size: int = 128
-    buffer_size: int = 100000
+    buffer_size: int = 10000
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
     value_layers: List[int] = field(default_factory=lambda: [4])
@@ -72,20 +74,20 @@ class Config:
     # --- SRRHUIF ND params ---
     tau_srrhuif: float = 0.005
     N_horizon: int = 5
-    q_std: float = 5e-3
-    r_std: float = 1.7
+    q_std: float = 1e-2
+    r_std: float = 1.8
 
     alpha: float = 0.99
     beta: float = 2.0
     kappa: float = 0.0
     p_init_min: float = 0.001
-    p_init_max: float = 0.016
+    p_init_max: float = 0.013
     adaptive_window: int = 15
     use_spas: bool = True   # ★ Sigma Point Action Selection
 
     # --- Adam D3QN params ---
     tau_adam: float = 0.005
-    adam_lr: float = 5e-4
+    adam_lr: float = 1e-3
 
     # --- Exploration ---
     eps_start: float = 0.99
@@ -575,6 +577,8 @@ class LivePlotter:
     def __init__(self, method_name: str, max_episodes: int):
         self.method_name = method_name
         self.rewards, self.losses, self.p_inits = [], [], []
+        self.total_time = 0.0
+        self.avg_step_time = 0.0
         self.fig, self.axes = plt.subplots(1, 3, figsize=(16, 4))
         
         # Reward plot
@@ -655,6 +659,9 @@ def train_srrhuif_nd():
     logger = LivePlotter(f"SRRHUIF-ND ({spas_str})", cfg.max_episodes)
     steps_done = 0
 
+    train_start_time = time.time()
+    update_times = []
+
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=cfg.seed + ep)
         ep_r, ep_l, ep_start = 0, [], time.time()
@@ -680,6 +687,8 @@ def train_srrhuif_nd():
             s, ep_r = ns, ep_r + r
 
             if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+                update_start = time.perf_counter()
+
                 batch = buffer.sample_batch(cfg.batch_size)
                 batch_hist.append(batch)
                 if len(batch_hist) == cfg.N_horizon:
@@ -691,6 +700,8 @@ def train_srrhuif_nd():
                         ep_l.append(l_val)
                     theta_target = (1.0 - cfg.tau_srrhuif) * theta_target + cfg.tau_srrhuif * theta
 
+                update_times.append(time.perf_counter() - update_start) # <-- 스텝 연산 종료 및 기록
+
             if done or trunc: break
 
         avg_l = np.mean(ep_l) if ep_l else 0
@@ -701,7 +712,12 @@ def train_srrhuif_nd():
             recent = np.mean(logger.rewards[-20:]) if len(logger.rewards) >= 20 else np.mean(logger.rewards)
             print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} "
                   f"| Loss: {avg_l:.4f} | P_init: {p_init:.4f} | Time: {time.time()-ep_start:.2f}s")
-
+            
+    # --- 추가된 부분: 최종 시간 계산 및 저장 ---
+    logger.total_time = time.time() - train_start_time
+    # ms(밀리초) 단위로 변환하여 저장
+    logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0 
+    # -------------------------------------------
     env.close()
     logger.refresh()  # final save
     logger.close()
@@ -730,6 +746,9 @@ def train_adam():
     logger = LivePlotter("Adam D3QN", cfg.max_episodes)
     steps_done = 0
 
+    train_start_time = time.time()
+    update_times = []
+
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=cfg.seed + ep)
         ep_r, ep_l, ep_start = 0, [], time.time()
@@ -750,6 +769,7 @@ def train_adam():
             s, ep_r = ns, ep_r + r
 
             if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+                update_start = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
                 s_b = batch['s'].t()
                 s_next_b = batch['s_next'].t()
@@ -777,7 +797,11 @@ def train_adam():
                         t_p.data.copy_(cfg.tau_adam * p.data + (1 - cfg.tau_adam) * t_p.data)
 
             if done or trunc: break
-            
+        
+        # --- 추가된 부분: 최종 시간 계산 및 저장 ---
+        logger.total_time = time.time() - train_start_time
+        logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0 
+    # -------------------------------------------
         scheduler.step()
         avg_l = np.mean(ep_l) if ep_l else 0
         logger.add(ep_r, avg_l)
@@ -850,6 +874,10 @@ def plot_comparison(srrhuif_log: LivePlotter, adam_log: LivePlotter):
         f"{'Max reward':<25} {max_s:>10.1f} {max_a:>10.1f}\n"
         f"{'First ep ≥195':<25} {first_195_s:>10d} {first_195_a:>10d}\n"
         f"{'First MA20 ≥400':<25} {first_400_s:>10d} {first_400_a:>10d}\n"
+        # --- 추가된 부분 ---
+        f"{'Total Time (s)':<25} {srrhuif_log.total_time:>10.1f} {adam_log.total_time:>10.1f}\n"
+        f"{'Avg Step Time (ms)':<25} {srrhuif_log.avg_step_time:>10.2f} {adam_log.avg_step_time:>10.2f}\n"
+        # -------------------
         f"{'─' * 47}\n"
         f"SPAS: {'ON' if cfg.use_spas else 'OFF'}\n"
         f"Params: R={cfg.r_std} Q={cfg.q_std} γ={cfg.gamma}\n"
