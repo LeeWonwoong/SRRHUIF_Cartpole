@@ -18,17 +18,18 @@ matplotlib.use('Agg')
 
 """
 =========================================================================
-SRRHUIF-D3QN v5: Node Decoupled + SPAS + Adaptive R + Adam Comparison
+SRRHUIF-D3QN v6.1: T_Var EMA Adaptive R + Precision Logging
 =========================================================================
-Changes from v4:
-  - ★ Removed Adaptive P_init (Fixed to a tuned constant, e.g., 0.3)
-  - ★ Added Reward MA-based Adaptive R logic
-  - Dynamic r_inv and r_inv_sqrt passed to filter core per episode
+Changes:
+  - Fixed P_init to a tuned constant (0.025).
+  - T_Var Global EMA implemented to prevent per-episode reset bug.
+  - Adaptive R logic calculates dynamically within the step horizon.
+  - LivePlotter Y-axis scaled to accommodate R_std expansion.
 =========================================================================
 """
 
 print("=" * 70)
-print(f"SRRHUIF-D3QN v5 (Adaptive R) | PyTorch: {torch.__version__}")
+print(f"SRRHUIF-D3QN v6.1 (T_Var Adaptive R) | PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -59,7 +60,7 @@ class Config:
 
     max_episodes: int = 200
     max_steps: int = 500
-    batch_size: int = 128 # 64에서 128로 복구하거나, 노이즈를 즐기려면 64 유지
+    batch_size: int = 128     
     buffer_size: int = 10000
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
@@ -74,18 +75,18 @@ class Config:
     N_horizon: int = 5
     q_std: float = 5e-3
     
-    # ★ Fixed P_init (튜닝으로 찾은 Sweet Spot)
+    # ★ Fixed P_init (튜닝된 고정값)
     p_init: float = 0.025
-    
-    # ★ Adaptive R params
-    r_std_min: float = 1.7
-    r_std_max: float = 2.0  
-    adaptive_window: int = 30
 
-    alpha: float = 0.9      # ND 환경 튜닝값 반영
-    beta: float = 2.0
+    # ★ Adaptive R 파라미터 
+    r_base: float = 1.3      # 초기 부스팅을 위한 낮은 방어력
+    r_scale: float = 0.15    # 폭주 방지용 스케일링
+    var_tau: float = 0.05    # EMA 업데이트 속도
+
+    alpha: float = 0.8       # 정밀 타격을 위한 시야각
+    beta: float = 2        # RL Heavy-tail 방어 (이전 타협점)
     kappa: float = 0.0
-    use_spas: bool = True
+    use_spas: bool = True    
 
     # --- Adam D3QN params ---
     tau_adam: float = 0.005
@@ -140,7 +141,6 @@ def create_network_info(dimS: int, nA: int, config: Config) -> Dict:
 
 
 class NDCache:
-    """Pre-compute + Unified FP32 Buffer for ND"""
     def __init__(self, info: Dict, cfg: Config, device: str):
         self.layers = {}
         total_forwards = 0
@@ -204,7 +204,7 @@ class InputNormalizer:
         else: return x / self.scale.view(-1, 1)
 
 # =========================================================================
-# 3. Forward Functions (FP32 internal)
+# 3. Forward Functions
 # =========================================================================
 def forward_single(theta, info, x):
     theta = theta.to(DTYPE_FWD)
@@ -267,7 +267,6 @@ def forward_bmm(thetas, info, x):
         a = F.relu(z) if i < len(info['layers']) - 1 else z
     return v + (a - a.mean(dim=1, keepdim=True))
 
-
 # =========================================================================
 # 4. Replay Buffer
 # =========================================================================
@@ -295,7 +294,6 @@ class TensorReplayBuffer:
         return {'s': self.S[indices].t(), 'a': self.A[indices], 'r': self.R[indices],
                 's_next': self.S_next[indices].t(), 'term': self.term[indices]}
 
-
 # =========================================================================
 # 5. Math Utilities (FP64)
 # =========================================================================
@@ -317,7 +315,6 @@ def robust_solve_spd_batch(S_tril_batch, y_batch, eye_batch):
     theta = torch.linalg.solve_triangular(S_safe.transpose(-2, -1).contiguous(), z, upper=True)
     return torch.where(torch.isfinite(theta), theta, torch.zeros_like(theta))
 
-
 # =========================================================================
 # 6. ND Compiled Core Functions
 # =========================================================================
@@ -336,7 +333,6 @@ def _nd_time_update_core(theta_3d, P_sqrt_prev, S_Q_cached, eye_batch, gamma_val
     ], dim=1)
     return S_pred, Y_pred, y_pred, X_sigma_all, scaled_P
 
-
 def _nd_compute_ht_core(Z_sigma_T_f32, Wm_col_f32, Wc_f32, zero_col_f32,
                          scaled_P_f32, z_measured_exp_f64, Y_pred_f64):
     z_hat_f32 = torch.bmm(Z_sigma_T_f32, Wm_col_f32)
@@ -351,7 +347,6 @@ def _nd_compute_ht_core(Z_sigma_T_f32, Wm_col_f32, Wc_f32, zero_col_f32,
     HT_all = torch.bmm(Y_pred_f64, P_xz_f32.to(torch.float64))
     return HT_all, residual_all, z_hat_f64
 
-
 def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all,
                           r_inv_sqrt, r_inv, eye_batch):
     combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
@@ -360,7 +355,6 @@ def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all,
     y_new_all = y_pred + torch.bmm(HT_all, r_inv * innov)
     theta_new_all = robust_solve_spd_batch(S_new_all, y_new_all, eye_batch)
     return theta_new_all, S_new_all
-
 
 if cfg.use_compile and hasattr(torch, 'compile') and cfg.device == 'cuda':
     _cm = 'default'
@@ -373,7 +367,6 @@ if cfg.use_compile and hasattr(torch, 'compile') and cfg.device == 'cuda':
 else:
     print("torch.compile disabled or CPU mode.")
 
-
 # =========================================================================
 # 7. Initialize theta
 # =========================================================================
@@ -385,14 +378,12 @@ def initialize_theta(info, device):
             torch.randn(W_len, dtype=DTYPE, device=device) * np.sqrt(2.0 / fan_in)
     return theta
 
-
 # =========================================================================
 # 8. SRRHUIF ND Step 
 # =========================================================================
 @torch.no_grad()
 def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
                     is_first, p_init_val, r_inv_sqrt, r_inv, nd_cache):
-    # ★ Added r_inv_sqrt, r_inv args
     device, info, batch_sz = sp['device'], sp['info'], sp['batch_sz']
     theta_prior = (theta_target if is_first else theta_current_in).clone()
     theta_current = theta_current_in.clone()
@@ -403,7 +394,6 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         s_batch = sp['normalizer'].normalize(s_batch)
         s_next = sp['normalizer'].normalize(s_next)
 
-    # Phase 1a: Time Update (FP64)
     unified = nd_cache.unified_thetas
     unified[:] = theta_current.squeeze().to(DTYPE_FWD)
 
@@ -442,7 +432,6 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
             'S_pred': S_pred, 'Y_pred': Y_pred, 'y_pred': y_pred, 'scaled_P': scaled_P,
         })
 
-    # DDQN Target
     if is_first:
         if cfg.use_spas:
             Q_sigma_f32 = forward_bmm(unified, info, s_next)
@@ -460,12 +449,12 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         q_val_next = Q_both_f32[1][a_best_next, torch.arange(batch_sz, device=device)].to(DTYPE)
 
     z_measured = (batch['r'] + cfg.gamma * (1 - batch['term']) * q_val_next).view(-1, 1)
-    # ★ 배치 내 Target의 분산 계산 (추가)
+    
+    # ★ 배치 내 타겟 분산 계산
     target_var = torch.var(z_measured).item()
-    # Phase 1b: Single forward_bmm for measurement
+
     Q_all_f32 = forward_bmm(unified, info, s_batch)
 
-    # Phase 1c: HT Computation
     layer_data = []
     for L in range(info['num_nd_layers']):
         td = time_data[L]
@@ -493,9 +482,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         })
         layer_count += 1
 
-    # Phase 2: Measurement Update (FP64)
     for L, data in enumerate(layer_data):
-        # ★ Using dynamically passed r_inv_sqrt and r_inv
         theta_new_all, S_new_all = _nd_meas_update_core(
             data['S_pred'], data['y_pred'], data['HT_all'],
             data['theta_all_prior_3d'], data['residual_all'],
@@ -513,11 +500,9 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         theta_current = theta_flat.view(-1, 1)
 
         new_S_info.append(S_new_all.permute(1, 2, 0))
-        total_loss = torch.tensor(0.0, dtype=DTYPE, device=device)
         total_loss = total_loss + data['loss']
 
-    return theta_current, new_S_info, (total_loss / layer_count).item() , target_var
-
+    return theta_current, new_S_info, (total_loss / layer_count).item(), target_var
 
 # =========================================================================
 # 9. Adam D3QN Module
@@ -552,14 +537,13 @@ class D3QNModule(nn.Module):
         a = self.advantage_head(h)
         return v + (a - a.mean(dim=-1, keepdim=True))
 
-
 # =========================================================================
 # 10. Training Loops
 # =========================================================================
 class LivePlotter:
     def __init__(self, method_name: str, max_episodes: int):
         self.method_name = method_name
-        self.rewards, self.losses, self.r_stds = [], [], [] # ★ changed to r_stds
+        self.rewards, self.losses, self.r_stds = [], [], []
         self.total_time = 0.0
         self.avg_step_time = 0.0
         self.fig, self.axes = plt.subplots(1, 3, figsize=(16, 4))
@@ -575,17 +559,14 @@ class LivePlotter:
         self.line_l, = self.ax_l.plot([], [], 'r-', linewidth=1.5)
         self.ax_l.set_title('TD Loss')
         
-        # ★ R plot
         self.ax_p = self.axes[2]
         self.line_p, = self.ax_p.plot([], [], 'g-', linewidth=2)
         self.ax_p.set_title('Adaptive R_std' if 'SRRHUIF' in method_name else 'Info')
-        if 'SRRHUIF' in method_name:
-            self.ax_p.set_ylim(0, cfg.r_std_max * 1.2)
         
-        self.ax_p.set_title('Target Variance' if 'SRRHUIF' in method_name else 'Info')
+        # ★ Y축 자동화: R이 2.5 이상 팽창할 수 있으므로 상한선을 [0, 3.0] 정도로 넉넉히 잡습니다.
         if 'SRRHUIF' in method_name:
-            self.ax_p.set_ylim(0, 500) # 분산값 스케일에 맞춰 y축 제한을 조절하세요
-            
+            self.ax_p.set_ylim(0, 3.0) 
+        
         plt.tight_layout()
         self.filename = method_name.replace(' ', '_').replace('(', '').replace(')', '')
     
@@ -601,15 +582,15 @@ class LivePlotter:
             ma = np.convolve(self.rewards, np.ones(20)/20, 'valid')
             self.line_r_ma.set_data(range(19, len(self.rewards)), ma)
         self.line_l.set_data(ep_range, self.losses)
-        self.line_p.set_data(ep_range, self.r_stds) # ★ 
+        self.line_p.set_data(ep_range, self.r_stds) 
         for ax in self.axes:
             ax.relim(); ax.autoscale_view()
         self.axes[0].set_ylim(0, max(max(self.rewards, default=520) * 1.1, 520))
+        # self.axes[2].set_ylim(0, max(max(self.r_stds, default=3.0) * 1.1, 3.0)) # 동적 조절 필요 시 활성화
         plt.savefig(f'{self.filename}_live.png', dpi=100)
     
     def close(self):
         plt.close(self.fig)
-
 
 def train_srrhuif_nd():
     set_all_seeds(cfg.seed)
@@ -619,7 +600,6 @@ def train_srrhuif_nd():
     spas_str = "SPAS" if cfg.use_spas else "StdDQN"
     print(f"\n{'='*60}")
     print(f"Training SRRHUIF-ND ({spas_str}) | Params: {info['total_params']} ")
-    print(f"P_init Fixed: {cfg.p_init} | Adaptive R: [{cfg.r_std_min} ~ {cfg.r_std_max}]")
     print(f"{'='*60}")
 
     normalizer = InputNormalizer(cfg.device) if cfg.use_input_norm else None
@@ -645,24 +625,13 @@ def train_srrhuif_nd():
     train_start_time = time.time()
     update_times = []
 
+    # ★ Global EMA 변수: 에피소드가 끝나도 분산의 기억이 유지되도록 루프 밖으로 빼냅니다.
+    ema_t_var = 0.0
+
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=cfg.seed + ep)
-        ep_r, ep_l, ep_start = 0, [], time.time()
-        
-        # ★ Adaptive R Logic: Calculate current R based on MA of past rewards
-        # ★ 수정된 정방향 Adaptive R Logic
-        start_idx = max(0, len(logger.rewards) - cfg.adaptive_window)
-        current_score = np.mean(logger.rewards[start_idx:]) if logger.rewards else 0
-
-        # ratio: 0.0 (완전 초반) ~ 1.0 (500점 만점 도달)
-        ratio = max(0.0, min(1.0, current_score / cfg.max_steps))
-
-        # ratio가 0이면 r_std_min(예: 1.0), 1이면 r_std_max(예: 1.8)이 되도록 정방향 스케일링
-        current_r_std = cfg.r_std_min + (cfg.r_std_max - cfg.r_std_min) * ratio
-        
-        # Convert to inv and inv_sqrt for the filter
-        r_inv_sqrt = 1.0 / current_r_std
-        r_inv = 1.0 / (current_r_std ** 2)
+        ep_r, ep_l, ep_var, ep_start = 0, [], [], time.time()
+        ep_r_stds = [] # 그래프 및 출력을 위해 이번 에피소드에서 계산된 R_std들을 모읍니다.
 
         for t in range(cfg.max_steps):
             steps_done += 1
@@ -679,38 +648,61 @@ def train_srrhuif_nd():
             ns, r, done, trunc, _ = env.step(a)
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
-            ep_r, ep_l, ep_var, ep_start = 0, [], [], time.time() # ★ ep_var 리스트 추가
-            
+
             if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
                 update_start = time.perf_counter()
 
                 batch = buffer.sample_batch(cfg.batch_size)
                 batch_hist.append(batch)
+                
                 if len(batch_hist) == cfg.N_horizon:
+                    
+                    # ★ 현재 EMA 기반으로 R 계산
+                    current_r_std = cfg.r_base + cfg.r_scale * ema_t_var
+                    r_inv_sqrt = 1.0 / current_r_std
+                    r_inv = 1.0 / (current_r_std ** 2)
+                    
+                    batch_t_vars = []
+                    
                     for h in range(cfg.N_horizon):
                         is_first = (h == 0)
-                        # ★ Pass Fixed p_init and Dynamic r_invs
                         theta, neuron_S_info, l_val, t_var = srrhuif_step_nd(
                             theta, theta_target, neuron_S_info, batch_hist[h],
                             sp, is_first, cfg.p_init, r_inv_sqrt, r_inv, nd_cache)
                         ep_l.append(l_val)
-                        ep_var.append(t_var)
+                        batch_t_vars.append(t_var)
+
                     theta_target = (1.0 - cfg.tau_srrhuif) * theta_target + cfg.tau_srrhuif * theta
+
+                    # ★ 이번 스텝의 평균 분산을 계산하고 Global EMA를 업데이트합니다.
+                    avg_batch_var = np.mean(batch_t_vars)
+                    if steps_done == cfg.N_horizon * cfg.update_interval: # 맨 처음 예열
+                        ema_t_var = avg_batch_var
+                    else:
+                        ema_t_var = (1 - cfg.var_tau) * ema_t_var + cfg.var_tau * avg_batch_var
+                        
+                    ep_var.append(avg_batch_var)
+                    ep_r_stds.append(current_r_std)
 
                 update_times.append(time.perf_counter() - update_start) 
 
             if done or trunc: break
 
         avg_l = np.mean(ep_l) if ep_l else 0
-        avg_v = np.mean(ep_var) if ep_var else 0 # ★ 평균 분산 계산
+        avg_v = np.mean(ep_var) if ep_var else 0 
+        avg_r_std = np.mean(ep_r_stds) if ep_r_stds else cfg.r_base # 이번 에피소드의 평균 R_std
         
-        logger.add(ep_r, avg_l, current_r_std) # ★ Log R instead of P
+        # ★ R_std 평균값을 로그에 반영
+        logger.add(ep_r, avg_l, avg_r_std) 
+        
         if ep % cfg.plot_interval == 0:
             logger.refresh()
+            
         if ep % 5 == 0:
             recent = np.mean(logger.rewards[-20:]) if len(logger.rewards) >= 20 else np.mean(logger.rewards)
+            # ★ 정확한 R_std 평균값을 콘솔에 출력
             print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} "
-                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | R_std: {current_r_std:.4f} | Time: {time.time()-ep_start:.2f}s")
+                  f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | R_std: {avg_r_std:.4f} | Time: {time.time()-ep_start:.2f}s")
             
     logger.total_time = time.time() - train_start_time
     logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0 
@@ -718,7 +710,6 @@ def train_srrhuif_nd():
     logger.refresh()
     logger.close()
     return logger
-
 
 def train_adam():
     set_all_seeds(cfg.seed)
@@ -796,7 +787,7 @@ def train_adam():
         logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0 
         scheduler.step()
         avg_l = np.mean(ep_l) if ep_l else 0
-        logger.add(ep_r, avg_l, 0.0) # Adam은 R_std가 없으므로 0 전달
+        logger.add(ep_r, avg_l, 0.0) 
         if ep % cfg.plot_interval == 0:
             logger.refresh()
         if ep % 10 == 0:
@@ -809,16 +800,12 @@ def train_adam():
     logger.close()
     return logger
 
-
-# =========================================================================
-# 11. Comparison Plot
-# =========================================================================
 def plot_comparison(srrhuif_log: LivePlotter, adam_log: LivePlotter):
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     ma_window = 20
     spas_str = "SPAS" if cfg.use_spas else "StdDQN"
     fig.suptitle(f"SRRHUIF-ND ({spas_str}) vs Adam D3QN | "
-                 f"Adaptive R=({cfg.r_std_min}~{cfg.r_std_max}) Q={cfg.q_std} γ={cfg.gamma}", fontsize=14) # ★ Title Update
+                 f"Adaptive R (Base={cfg.r_base}, Scale={cfg.r_scale}) Q={cfg.q_std} γ={cfg.gamma}", fontsize=14)
 
     # Row 1: Rewards
     ax = axes[0]
@@ -869,7 +856,7 @@ def plot_comparison(srrhuif_log: LivePlotter, adam_log: LivePlotter):
         f"{'Avg Step Time (ms)':<25} {srrhuif_log.avg_step_time:>10.2f} {adam_log.avg_step_time:>10.2f}\n"
         f"{'─' * 47}\n"
         f"SPAS: {'ON' if cfg.use_spas else 'OFF'}\n"
-        f"Params: R=({cfg.r_std_min}~{cfg.r_std_max}) Q={cfg.q_std} γ={cfg.gamma}\n"
+        f"Params: R=({cfg.r_base} + {cfg.r_scale}*Var) Q={cfg.q_std} γ={cfg.gamma}\n"
         f"Horizon={cfg.N_horizon} Batch={cfg.batch_size}"
     )
     ax.text(0.05, 0.95, summary, transform=ax.transAxes, fontsize=10,
@@ -882,10 +869,6 @@ def plot_comparison(srrhuif_log: LivePlotter, adam_log: LivePlotter):
     print(f"\nComparison plot saved: {filename}")
     plt.close()
 
-
-# =========================================================================
-# 12. Main
-# =========================================================================
 def main():
     print(f"\n{'#' * 70}")
     print(f"  SRRHUIF-ND ({'SPAS' if cfg.use_spas else 'Standard'}) vs Adam D3QN Comparison")
@@ -903,7 +886,6 @@ def main():
     print(f"\n{'=' * 70}")
     print("DONE")
     print(f"{'=' * 70}")
-
 
 if __name__ == "__main__":
     main()
