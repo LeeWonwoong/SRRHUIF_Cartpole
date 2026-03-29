@@ -78,10 +78,12 @@ class Config:
     # ★ Fixed P_init (튜닝된 고정값)
     p_init: float = 0.025
 
-    # ★ Adaptive R 파라미터 
-    r_base: float = 1.3      # 초기 부스팅을 위한 낮은 방어력
-    r_scale: float = 0.15    # 폭주 방지용 스케일링
-    var_tau: float = 0.05    # EMA 업데이트 속도
+    # Adaptive R 파라미터 미세 튜닝
+    # ★ 2. Measurement Uncertainty (안전장치가 추가된 Adaptive R)
+    r_base: float = 1.2       # 초반 가속
+    r_scale: float = 0.25     # (상향) 0.10 -> 0.13 : T_Var가 7일 때 R을 2.1까지 팽창
+    r_max: float = 5        # (신규) R이 절대 3를 넘지 않도록 막는 강력한 족쇄 (상한선)
+    var_tau: float = 0.1      # 기민한 반응 속도
 
     alpha: float = 0.8       # 정밀 타격을 위한 시야각
     beta: float = 2        # RL Heavy-tail 방어 (이전 타협점)
@@ -655,10 +657,15 @@ def train_srrhuif_nd():
                 batch = buffer.sample_batch(cfg.batch_size)
                 batch_hist.append(batch)
                 
+                # Horizon 업데이트 진입 시 Adaptive R 계산
                 if len(batch_hist) == cfg.N_horizon:
                     
-                    # ★ 현재 EMA 기반으로 R 계산
-                    current_r_std = cfg.r_base + cfg.r_scale * ema_t_var
+                    # ★ 1. 수식으로 먼저 R 계산
+                    calculated_r_std = cfg.r_base + cfg.r_scale * ema_t_var
+                    
+                    # ★ 2. 상한선(r_max) 적용 (Clamping)
+                    current_r_std = min(calculated_r_std, cfg.r_max)
+                    
                     r_inv_sqrt = 1.0 / current_r_std
                     r_inv = 1.0 / (current_r_std ** 2)
                     
