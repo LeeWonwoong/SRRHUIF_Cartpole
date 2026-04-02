@@ -92,7 +92,7 @@ class Config:
 
     update_interval: int = 1
     use_input_norm: bool = True
-    use_compile: bool = False
+    use_compile: bool = True
     plot_interval: int = 10
     seed: int = 0
 
