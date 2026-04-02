@@ -117,6 +117,15 @@ args, _ = parser.parse_known_args()
 
 cfg = Config()
 
+cfg.alpha = args.alpha
+cfg.beta = args.beta
+cfg.r_std = args.r_std
+cfg.p_init_max = args.p_max
+cfg.max_episodes = args.episodes
+
+# 값 적용 후 폴더 경로를 새로 고침 합니다.
+cfg.__post_init__()
+
 # =========================================================================
 # 2. Network Info & Cache
 # =========================================================================
