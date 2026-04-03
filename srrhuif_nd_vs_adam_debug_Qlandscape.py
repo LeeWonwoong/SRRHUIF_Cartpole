@@ -587,7 +587,7 @@ def plot_cartpole_state_landscape(theta_star, info, cfg, normalizer, method_name
     X, Y = np.meshgrid(theta_range, theta_dot_range)
     states = np.zeros((resolution * resolution, 4))
     states[:, 2] = X.flatten(); states[:, 3] = Y.flatten()
-    states_t = torch.tensor(states, dtype=DTYPE, device=device)
+    states_t = torch.tensor(states, dtype=torch.float64, device=device)
     if normalizer: states_t = normalizer.normalize(states_t)
         
     with torch.no_grad():
@@ -597,15 +597,28 @@ def plot_cartpole_state_landscape(theta_star, info, cfg, normalizer, method_name
     Z = max_q.reshape(resolution, resolution)
     fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection='3d')
-    surf = ax.plot_surface(X, Y, Z, cmap='plasma', edgecolor='none', alpha=0.8)
     
+    # 1. 3D 표면(Surface) 그리기
+    surf = ax.plot_surface(X, Y, Z, cmap='plasma', edgecolor='none', alpha=0.85)
+    
+    # ★ 2. 바닥에 등고선(Contour) 투영하기 (허공에 떠보이는 현상 해결)
+    z_min, z_max = np.min(Z), np.max(Z)
+    z_floor = z_min - (z_max - z_min) * 0.15 # 바닥 위치를 표면보다 살짝 아래로 설정
+    ax.contourf(X, Y, Z, zdir='z', offset=z_floor, cmap='plasma', alpha=0.5)
+    
+    # ★ 3. Z축 리밋을 바닥선에 맞게 고정
+    ax.set_zlim(z_floor, z_max)
+    
+    # ★ 4. 지형이 가장 잘 보이는 카메라 각도로 조정
+    ax.view_init(elev=25, azim=230)
+
     ax.set_title(f'State-Space Q-Landscape: {method_name}\n({param_str})')
     ax.set_xlabel('Pole Angle (rad)'); ax.set_ylabel('Angular Velocity (rad/s)'); ax.set_zlabel('Max Q-value')
-    fig.colorbar(surf, shrink=0.5, aspect=5)
+    fig.colorbar(surf, shrink=0.5, aspect=5, pad=0.1)
     
     clean_name = method_name.replace(' ', '_').replace('(', '').replace(')', '')
     filename = os.path.join(cfg.outdir, f"{param_str}_{clean_name}_State_Land.png")
-    plt.savefig(filename, dpi=150)
+    plt.savefig(filename, dpi=150, bbox_inches='tight') # 여백 제거
     plt.close()
     print(f"[*] 상태 공간 지형도 저장: {filename}")
 
