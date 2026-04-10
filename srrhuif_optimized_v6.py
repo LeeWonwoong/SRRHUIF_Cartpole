@@ -75,7 +75,7 @@ class Config:
     tau_srrhuif: float = 0.015    # ← 올림 (긴 호라이즌 → 좋은 추정 → 빠른 추적)
     N_horizon: int = 9          # ← 늘림 (burn-in + estimation 확보)
     q_std: float = 5e-4          # ← 올림 (P가 호라이즌 끝까지 살아있게)
-    r_std: float = 1.8          # ← 약간 올림
+    r_std: float = 1.0         # ← 약간 올림
 
     alpha: float = 0.99
     beta: float = 2.0   
@@ -985,7 +985,8 @@ def train_srrhuif_nd():
         s, _ = env.reset(seed=cfg.seed + ep)
         ep_r, ep_l, ep_var, ep_k_gain, ep_start = 0, [], [], [], time.time()
         ep_q0, ep_q1 = [], []
-        
+
+        last_h_k_traj = []
         # ★ Fixed P_init (no adaptive schedule)
         p_init = cfg.p_init
 
@@ -1038,10 +1039,7 @@ def train_srrhuif_nd():
 
                     theta_target = (1.0 - cfg.tau_srrhuif) * theta_target + cfg.tau_srrhuif * theta
                     # ★ 에피소드의 마지막 업데이트일 때만 터미널에 궤적 출력 (너무 많은 출력 방지)
-                    if done or trunc:
-                        # 소수점 4자리까지만 예쁘게 포맷팅
-                        traj_str = "[" + ", ".join([f"{k:.4f}" for k in h_k_traj]) + "]"
-                        print(f"      └─▶ Horizon K_Gain Trajectory: {traj_str}")
+                    last_h_k_traj = h_k_traj
 
                 update_times.append(time.perf_counter() - update_start) 
             if done or trunc: break
@@ -1065,7 +1063,11 @@ def train_srrhuif_nd():
             print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | P: {p_init:.4f} | K_Gain: {avg_k:.4f} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | Time: {time.time()-ep_start:.2f}s")
-                  
+            # ★ 3. 메인 로그 바로 밑에 예쁘게 맞춰서 출력
+            if last_h_k_traj:
+                traj_str = "[" + ", ".join([f"{k:.4f}" for k in last_h_k_traj]) + "]"
+                print(f"          └─▶ Horizon K_Gain Trajectory: {traj_str}")
+
     logger.total_time = time.time() - train_start_time
     logger.avg_step_time = (np.mean(update_times) * 1000) if update_times else 0.0 
     env.close()
