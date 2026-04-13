@@ -49,7 +49,7 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float64)
 DTYPE = torch.float64
 DTYPE_FWD = torch.float32
-JITTER = 1e-7
+JITTER = 1e-10
 
 # =========================================================================
 # 1. Configuration (FIR Philosophy: fixed params, no adaptive schedule)
