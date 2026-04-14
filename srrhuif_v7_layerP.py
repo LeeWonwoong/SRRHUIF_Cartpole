@@ -73,7 +73,7 @@ class Config:
     
     # Fixed P_init (acting as p_base for Layer-wise He-scaling)
     p_init: float = 0.08       # ★ 변경: 0.013 -> 0.08 (He-scale의 Base 값 역할)
-    value_layer_scale : float = 0.1
+    value_layer_scale : float = 0.2
     use_spas: bool = True  
 
     # --- Exploration ---
@@ -109,6 +109,7 @@ parser.add_argument('--horizon', type=int, default=cfg.N_horizon)
 parser.add_argument('--batch', type=int, default=cfg.batch_size)
 parser.add_argument('--q_std', type=float, default=cfg.q_std)
 parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
+parser.add_argument('--value_layer_scale', type=float, default=cfg.value_layer_scale)
 args, _ = parser.parse_known_args()
 
 cfg.alpha = args.alpha
@@ -120,6 +121,7 @@ cfg.N_horizon = args.horizon
 cfg.batch_size = args.batch
 cfg.q_std = args.q_std
 cfg.tau_srrhuif = args.tau
+cfg.value_layer_scale = args.value_layer_scale
 cfg.__post_init__()
 
 # =========================================================================
