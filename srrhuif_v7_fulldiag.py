@@ -58,33 +58,33 @@ JITTER = 1e-10
 class Config:
     env_name: str = "CartPole-v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-    max_episodes: int = 150
+    max_episodes: int = 120
     max_steps: int = 500
-    batch_size: int = 64        # ← 줄임 (32×16=512 총량 유지)
+    batch_size: int = 64       # ← 줄임 (32×16=512 총량 유지)
     buffer_size: int = 10000
 
-    shared_layers: List[int] = field(default_factory=lambda: [16, 16])
-    value_layers: List[int] = field(default_factory=lambda: [4])
-    advantage_layers: List[int] = field(default_factory=lambda: [4])
+    shared_layers: List[int] = field(default_factory=lambda: [32, 24])
+    value_layers: List[int] = field(default_factory=lambda: [8])
+    advantage_layers: List[int] = field(default_factory=lambda: [8])
 
-    gamma: float = 0.94
+    gamma: float = 0.9
     scale_factor: float = 1.0
     
     # --- SRRHUIF ND params (FIR: all fixed) ---
-    tau_srrhuif: float = 0.02    # ← 올림 (긴 호라이즌 → 좋은 추정 → 빠른 추적)
+    tau_srrhuif: float = 0.01   # ← 올림 (긴 호라이즌 → 좋은 추정 → 빠른 추적)
     N_horizon: int = 9          # ← 늘림 (burn-in + estimation 확보)
-    q_std: float = 5e-4        # ← 올림 (P가 호라이즌 끝까지 살아있게)
-    r_std: float = 1.3         # ← 약간 올림
+    q_std: float = 5e-4       # ← 올림 (P가 호라이즌 끝까지 살아있게)
+    r_std: float = 1.8   # ← 약간 올림
 
-    alpha: float = 0.99
+    alpha: float = 0.3
     beta: float = 2.0   
     kappa: float = 0.0
     
-    max_k_gain: float = 0.9
+    max_k_gain: float = 0.0
     
     # Fixed P_init (no adaptive)
-    p_init: float = 0.013
+    p_init: float = 0.03
+    value_layer_scale: float = 1
     use_spas: bool = True  
 
     # --- Exploration ---
@@ -92,17 +92,18 @@ class Config:
     eps_end: float = 0.001
     eps_decay_steps: int = 3000
 
-    update_interval: int = 4
+    update_interval: int = 2
     use_input_norm: bool = True
     use_compile: bool = True
     plot_interval: int = 10
+    log_interval : int = 1
     seed: int = 0
 
     def __post_init__(self):
         self.r_inv_sqrt = 1.0 / self.r_std
         self.r_inv = 1.0 / (self.r_std ** 2)
 
-        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}"
+        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_vs{self.value_layer_scale}"
         self.outdir = f"./results_cartpole/{self.param_str}"
         os.makedirs(self.outdir, exist_ok=True)
 
@@ -120,6 +121,7 @@ parser.add_argument('--horizon', type=int, default=cfg.N_horizon)
 parser.add_argument('--batch', type=int, default=cfg.batch_size)
 parser.add_argument('--q_std', type=float, default=cfg.q_std)
 parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
+parser.add_argument('--value_layer_scale', type=float, default=cfg.value_layer_scale) 
 args, _ = parser.parse_known_args()
 
 cfg.alpha = args.alpha
@@ -131,6 +133,8 @@ cfg.N_horizon = args.horizon
 cfg.batch_size = args.batch
 cfg.q_std = args.q_std
 cfg.tau_srrhuif = args.tau
+cfg.value_layer_scale = args.value_layer_scale
+
 cfg.__post_init__()
 
 # =========================================================================
@@ -475,7 +479,11 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
 
         S_3d = neuron_S_info[L]
         if is_first or S_3d is None:
-            P_sqrt_prev = np.sqrt(p_init_val) * lc['eye_n_per_batch'].clone()
+            current_p_init = p_init_val
+            if cfg.value_layer_scale != 1.0 and ('value' in nd_layer['type'] or 'advantage' in nd_layer['type']):
+                current_p_init = p_init_val * cfg.value_layer_scale
+                
+            P_sqrt_prev = np.sqrt(current_p_init) * lc['eye_n_per_batch'].clone()
         else:
             P_sqrt_prev = safe_inv_tril_batch(S_3d.permute(2, 0, 1), lc['eye_n_per_batch'])
 
@@ -1246,9 +1254,9 @@ def train_srrhuif_nd():
             theta_snapshots[ep] = theta.clone()
 
         if ep % cfg.plot_interval == 0: logger.refresh()
-        if ep % 5 == 0:
+        if ep % cfg.log_interval == 0:
             recent = np.mean(logger.rewards[-20:]) if len(logger.rewards) >= 20 else np.mean(logger.rewards)
-            print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} "
+            print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | P: {p_init:.4f} | K_Gain: {avg_k:.4f} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | Time: {time.time()-ep_start:.2f}s")
 
@@ -1275,19 +1283,23 @@ def train_srrhuif_nd():
                 ep_cos_str = f"{last_ep_cos:+.3f}" if last_ep_cos is not None else "N/A"
                 print(f"          └─▶ ep_cos: {ep_cos_str} | θ-target drift: {target_drift:.4f} | ep_Δθ: {ep_delta_norm:.4f}")
                 # ★ Per-layer breakdown (마지막 호라이즌의 h=0과 h=last)
-                if last_h_layer_ht and len(last_h_layer_ht) >= 2:
+                # ★ Per-layer breakdown (모든 호라이즌 전체 출력)
+                if last_h_layer_ht:
                     labels = sorted(last_h_layer_ht[0].keys())
-                    ht_h0 = " ".join([f"{l}={last_h_layer_ht[0][l]:.2f}" for l in labels])
-                    ht_hN = " ".join([f"{l}={last_h_layer_ht[-1][l]:.2f}" for l in labels])
-                    dk_h0 = " ".join([f"{l}={last_h_layer_delta[0][l]:.4f}" for l in labels])
-                    dk_hN = " ".join([f"{l}={last_h_layer_delta[-1][l]:.4f}" for l in labels])
-                    # 가장 큰 H^T를 가진 레이어 찾기 (전 호라이즌에서)
+                    
+                    # 1. 모든 호라이즌의 ||H^T|| 출력
+                    for h_idx in range(len(last_h_layer_ht)):
+                        ht_str = " ".join([f"{l}={last_h_layer_ht[h_idx][l]:.2f}" for l in labels])
+                        print(f"          └─▶ ||H^T|| h={h_idx}:  {ht_str}")
+                        
+                    # 2. 모든 호라이즌의 ||Δθ|| 출력
+                    for h_idx in range(len(last_h_layer_delta)):
+                        dk_str = " ".join([f"{l}={last_h_layer_delta[h_idx][l]:.4f}" for l in labels])
+                        print(f"          └─▶ ||Δθ||  h={h_idx}:  {dk_str}")
+                        
+                    # 3. Dominant layer 찾기
                     max_ht_per_layer = {l: max(last_h_layer_ht[h][l] for h in range(len(last_h_layer_ht))) for l in labels}
                     dominant = max(max_ht_per_layer, key=max_ht_per_layer.get)
-                    print(f"          └─▶ ||H^T|| h=0:  {ht_h0}")
-                    print(f"          └─▶ ||H^T|| h={len(last_h_layer_ht)-1}:  {ht_hN}")
-                    print(f"          └─▶ ||Δθ||  h=0:  {dk_h0}")
-                    print(f"          └─▶ ||Δθ||  h={len(last_h_layer_delta)-1}:  {dk_hN}")
                     print(f"          └─▶ Dominant layer: {dominant} (max||H^T||={max_ht_per_layer[dominant]:.1f})")
 
     logger.total_time = time.time() - train_start_time
