@@ -158,7 +158,7 @@ class Config:
         self.r_inv = 1.0 / (self.r_std ** 2)
         self.tikhonov_sqrt = float(np.sqrt(self.tikhonov_lambda))
         
-        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}"
+        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}_tikhonov{self.tikhonov_lambda}"
         self.outdir = f"./results_cartpole/{self.param_str}"
         os.makedirs(self.outdir, exist_ok=True)
 
