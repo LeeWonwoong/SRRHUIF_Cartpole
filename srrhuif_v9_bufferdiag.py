@@ -107,7 +107,7 @@ class Config:
     max_episodes: int = 120
     max_steps: int = 500
     batch_size: int = 64
-    buffer_size: int = 30000
+    buffer_size: int = 30000 #30000 CHANGEd 
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
     value_layers: List[int] = field(default_factory=lambda: [4])
@@ -121,9 +121,11 @@ class Config:
     q_std: float = 5e-4
     r_std: float = 2.0
 
-    alpha: float = 0.5
+    alpha: float = 0.3
     beta: float = 2.0   
     kappa: float = 0.0
+    
+    tikhonov_lambda: float = 1e-8
     
     max_k_gain: float = 0.0
     
@@ -154,8 +156,9 @@ class Config:
     def __post_init__(self):
         self.r_inv_sqrt = 1.0 / self.r_std
         self.r_inv = 1.0 / (self.r_std ** 2)
-
-        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_vs{self.value_layer_scale}"
+        self.tikhonov_sqrt = float(np.sqrt(self.tikhonov_lambda))
+        
+        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}"
         self.outdir = f"./results_cartpole/{self.param_str}"
         os.makedirs(self.outdir, exist_ok=True)
 
@@ -680,8 +683,14 @@ def _nd_compute_ht_core(Z_sigma_T_f32, Wm_col_f32, Wc_f32, zero_col_f32,
     
     return HT_all, residual_all, z_hat_f64, ht_norm, resid_norm
 
-def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all, r_inv_sqrt, r_inv, eye_batch):
-    combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
+def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all, 
+                            r_inv_sqrt, r_inv, eye_batch, tikhonov_sqrt=0.0):
+    if tikhonov_sqrt > 0:
+        combined = torch.cat([S_pred, HT_all * r_inv_sqrt, tikhonov_sqrt * eye_batch], dim=2)
+    else:
+        combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
+
+    #combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
     S_new_all = tria_operation_batch(combined)
     
     ht_theta = torch.bmm(HT_all.transpose(1, 2), theta_3d)
@@ -744,7 +753,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         s_batch = sp['normalizer'].normalize(s_batch)
         s_next = sp['normalizer'].normalize(s_next)
 
-    s_batch = s_batch + torch.randn_like(s_batch) * 0.02
+    # s_batch = s_batch + torch.randn_like(s_batch) * 0.02
     unified = nd_cache.unified_thetas
     unified[:] = theta_current.squeeze().to(DTYPE_FWD)
 
@@ -882,7 +891,8 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
 
         theta_new_g, S_new_g, meas_stats = _nd_meas_update_core(
             all_S_pred, all_y_pred, all_HT, all_theta_3d,
-            all_residual, cfg.r_inv_sqrt, cfg.r_inv, grp['eye_grouped'])
+            all_residual, cfg.r_inv_sqrt, cfg.r_inv, grp['eye_grouped'],
+            tikhonov_sqrt=cfg.tikhonov_sqrt)
 
         total_innov_mean += meas_stats['innov_mean'].item()
         total_innov_max = max(total_innov_max, meas_stats['innov_max'].item())
