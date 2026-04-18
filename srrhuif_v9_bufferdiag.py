@@ -125,7 +125,7 @@ class Config:
     beta: float = 2.0   
     kappa: float = 0.0
     
-    tikhonov_lambda: float = 1e-8
+    tikhonov_lambda: float = 1e-4
     
     max_k_gain: float = 0.0
     
@@ -178,6 +178,7 @@ parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
 parser.add_argument('--value_layer_scale', type=float, default=cfg.value_layer_scale) 
 parser.add_argument('--use_full_eigvalsh', action='store_true', default=cfg.use_full_eigvalsh)
 parser.add_argument('--no_file_log', action='store_true', default=False)
+parser.add_argument('--tikhonov', type=float, default=cfg.tikhonov_lambda)
 args, _ = parser.parse_known_args()
 
 cfg.alpha = args.alpha
@@ -191,6 +192,8 @@ cfg.q_std = args.q_std
 cfg.tau_srrhuif = args.tau
 cfg.value_layer_scale = args.value_layer_scale
 cfg.use_full_eigvalsh = args.use_full_eigvalsh
+cfg.tikhonov_lambda = args.tikhonov
+
 if args.no_file_log:
     cfg.save_file_log = False
 
