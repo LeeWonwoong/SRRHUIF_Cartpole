@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 import time
 import os
-import sys
 import random
 import argparse
 import warnings
@@ -20,63 +19,27 @@ matplotlib.use('Agg')
 
 """
 =========================================================================
-SRRHUIF-D3QN v9.0: Buffer Diversity + File Logging
+SRRHUIF-D3QN v8.0: Full Horizon Log + Diagnostic Edition
 =========================================================================
-v8 기반 + 추가:
-  [Buffer diversity tracking (매 에피소드)]
-    - state_std, state_range: state 분포 다양성
-    - done_ratio: buffer 내 terminal sample 비율
-    - reward_std: reward 분산
-    - buffer_fill_ratio: 버퍼 채움률
-    - is_saturated: 버퍼 최초 가득찬 에피소드 추적
-
-  [로그 파일 저장]
-    - stdout + 파일 동시 기록
-    - {outdir}/training_log.txt 자동 생성
-    - print() → log() 함수로 통일
+v7 fulldiag 기반 + 진단 로그 추가:
+  [호라이즌 단위 (h=0..N-1)]  ← 기존 ||H^T||, ||Δθ||, cos(δ) 등과 함께
+    - cond(Y) per layer: S 대각 기반 pseudo condition number
+    - Y_max per layer: max eigenvalue 근사
+  
+  [에피소드 단위]
+    - ||θ|| per layer: 파라미터 norm 진화
+    - Adv null/signal ratio: Dueling identifiability 지표
+    - Shared eff_rank + stable_rank: Feature collapse 지표
+    - Argmax flip rate: Update-induced policy instability
+    - Reference state ΔQ: 5개 고정 state에서 Q(right)-Q(left)
+  
+  [옵션]
+    - --use_full_eigvalsh: 정확한 condition number (느림)
 =========================================================================
 """
 
-# =========================================================================
-# Dual Output Logger (console + file)
-# =========================================================================
-class DualLogger:
-    """콘솔 + 파일 동시 출력"""
-    def __init__(self, filepath):
-        self.filepath = filepath
-        self.file = open(filepath, 'w', encoding='utf-8')
-        self.stdout = sys.stdout
-    
-    def write(self, msg):
-        self.stdout.write(msg)
-        self.file.write(msg)
-        self.file.flush()  # 실시간 저장
-    
-    def flush(self):
-        self.stdout.flush()
-        self.file.flush()
-    
-    def close(self):
-        self.file.close()
-
-# 글로벌 logger (나중에 설정)
-_dual_logger = None
-
-def setup_file_logging(filepath):
-    global _dual_logger
-    _dual_logger = DualLogger(filepath)
-    sys.stdout = _dual_logger
-    print(f"[Logging] 모든 stdout이 저장됨: {filepath}")
-
-def close_file_logging():
-    global _dual_logger
-    if _dual_logger is not None:
-        sys.stdout = _dual_logger.stdout
-        _dual_logger.close()
-        _dual_logger = None
-
 print("=" * 70)
-print(f"SRRHUIF-D3QN v9.0 (Buffer Diag + FileLog) | PyTorch: {torch.__version__}")
+print(f"SRRHUIF-D3QN v8.0 (FullDiag) | PyTorch: {torch.__version__}")
 if torch.cuda.is_available():
     print(f"Device: {torch.cuda.get_device_name(0)}")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -98,16 +61,16 @@ DTYPE_FWD = torch.float32
 JITTER = 1e-12
 
 # =========================================================================
-# 1. Configuration
+# 1. Configuration (업로드 파일 기준 설정 유지)
 # =========================================================================
 @dataclass
 class Config:
     env_name: str = "CartPole-v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    max_episodes: int = 200
+    max_episodes: int = 120
     max_steps: int = 500
     batch_size: int = 64
-    buffer_size: int = 30000 #30000 CHANGEd 
+    buffer_size: int = 30000
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
     value_layers: List[int] = field(default_factory=lambda: [4])
@@ -118,6 +81,7 @@ class Config:
     
     tau_srrhuif: float = 0.02
     N_horizon: int = 9
+
     q_std: float = 5e-4
     r_std: float = 2.0
 
@@ -125,7 +89,6 @@ class Config:
     beta: float = 2.0   
     kappa: float = 0.0
     
-    tikhonov_lambda: float = 0.0
     max_k_gain: float = 0.0
     
     p_init: float = 0.03
@@ -134,9 +97,7 @@ class Config:
 
     eps_start: float = 0.99
     eps_end: float = 0.001
-    eps_decay_steps: int = 2500
-
-    warmup_step : int = 0
+    eps_decay_steps: int = 3000
 
     update_interval: int = 4
     use_input_norm: bool = True
@@ -146,20 +107,18 @@ class Config:
     seed: int = 0
     
     # === DIAGNOSTIC FLAGS ===
-    use_full_eigvalsh: bool = True
-    diag_ref_states: bool = True
-    diag_argmax_flip: bool = True
-    diag_eff_rank: bool = True
-    diag_horizon_cond: bool = True
-    diag_buffer: bool = True         # NEW: Buffer diversity 추적
-    save_file_log: bool = True       # NEW: 로그 파일 저장
+    use_full_eigvalsh: bool = True      # True시 정확한 cond 계산 (느림)
+    diag_ref_states: bool = True         # Q_ref_state 추적
+    diag_argmax_flip: bool = True        # argmax flip rate
+    diag_eff_rank: bool = True           # shared output effective rank
+    diag_horizon_cond: bool = True       # 호라이즌별 cond/Y_max
 
     def __post_init__(self):
         self.r_inv_sqrt = 1.0 / self.r_std
         self.r_inv = 1.0 / (self.r_std ** 2)
-        self.tikhonov_sqrt = float(np.sqrt(self.tikhonov_lambda))
         
-        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}_tikhonov{self.tikhonov_lambda}"
+        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}"
+
         self.outdir = f"./results_cartpole/{self.param_str}"
         os.makedirs(self.outdir, exist_ok=True)
 
@@ -176,11 +135,8 @@ parser.add_argument('--horizon', type=int, default=cfg.N_horizon)
 parser.add_argument('--batch', type=int, default=cfg.batch_size)
 parser.add_argument('--q_std', type=float, default=cfg.q_std)
 parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
-parser.add_argument('--warmup_step', type=int, default=cfg.warmup_step)
 parser.add_argument('--value_layer_scale', type=float, default=cfg.value_layer_scale) 
 parser.add_argument('--use_full_eigvalsh', action='store_true', default=cfg.use_full_eigvalsh)
-parser.add_argument('--no_file_log', action='store_true', default=False)
-parser.add_argument('--tikhonov', type=float, default=cfg.tikhonov_lambda)
 args, _ = parser.parse_known_args()
 
 cfg.alpha = args.alpha
@@ -194,11 +150,6 @@ cfg.q_std = args.q_std
 cfg.tau_srrhuif = args.tau
 cfg.value_layer_scale = args.value_layer_scale
 cfg.use_full_eigvalsh = args.use_full_eigvalsh
-cfg.warmup_step = args.warmup_step
-cfg.tikhonov_lambda = args.tikhonov
-
-if args.no_file_log:
-    cfg.save_file_log = False
 
 cfg.__post_init__()
 
@@ -312,7 +263,7 @@ class InputNormalizer:
         else: return x / self.scale.view(-1, 1)
 
 # =========================================================================
-# 3. Forward Functions
+# 3. Forward Functions & Replay Buffer & Math Utils
 # =========================================================================
 def forward_single(theta, info, x):
     theta = theta.to(DTYPE_FWD)
@@ -344,6 +295,7 @@ def forward_single(theta, info, x):
     return (v + (a - a.mean(dim=0, keepdim=True))).to(DTYPE)
 
 def forward_single_with_shared(theta, info, x):
+    """(Q, shared_output) 반환 — effective rank 계산용"""
     theta = theta.to(DTYPE_FWD)
     if theta.dim() == 2: theta = theta.squeeze()
     x = x.to(DTYPE_FWD)
@@ -411,34 +363,16 @@ class TensorReplayBuffer:
         self.R = torch.zeros(capacity, dtype=DTYPE, device=device)
         self.S_next = torch.zeros(capacity, dimS, dtype=DTYPE, device=device)
         self.term = torch.zeros(capacity, dtype=DTYPE, device=device)
-        
-        # === NEW: episode-id tracking (buffer 내 age 계산용) ===
-        self.ep_id = torch.zeros(capacity, dtype=torch.long, device=device)
-        self.current_ep = 0
 
     def push(self, s, a, r, s_next, done):
         idx = self.count % self.capacity
         self.S[idx] = torch.as_tensor(s, dtype=DTYPE, device=self.device)
         self.A[idx] = a; self.R[idx] = r
         self.S_next[idx] = torch.as_tensor(s_next, dtype=DTYPE, device=self.device)
-        self.term[idx] = float(done)
-        self.ep_id[idx] = self.current_ep
-        self.count += 1
-
-    def set_current_episode(self, ep):
-        self.current_ep = ep
+        self.term[idx] = float(done); self.count += 1
 
     @property
     def current_size(self): return min(self.count, self.capacity)
-
-    @property
-    def is_saturated(self):
-        """한 번이라도 가득 찼는지"""
-        return self.count >= self.capacity
-
-    @property
-    def fill_ratio(self):
-        return self.current_size / self.capacity
 
     def sample_batch(self, batch_size: int) -> Dict:
         indices = torch.randint(0, self.current_size, (batch_size,), device=self.device)
@@ -468,49 +402,28 @@ def robust_solve_spd_batch(S_tril_batch, y_batch, eye_batch):
 @torch.no_grad()
 def compute_pseudo_cond_from_S(S_batch):
     """
-    S is Y^(1/2) (information matrix square root, lower triangular).
-    Y = S · S^T.
-    Eigenvalues of Y = (singular values of S)^2.
-    
-    Returns: (cond_avg, y_max, y_min, p_max)
-      - cond_avg: avg cond(Y) across neurons
-      - y_max: max eigenvalue of Y (= 1/P_min)
-      - y_min: min eigenvalue of Y (= 1/P_max)
-      - p_max: max eigenvalue of P (for reference)
+    S의 대각 기반 pseudo condition number.
+    S가 lower triangular이고 Y = S^-T S^-1 이므로 Y 대각 ≈ 1/S_diag²
+    거의 공짜.
+    Returns: (cond_mean, y_max_over_batch, y_min_over_batch)
     """
-    try:
-        # S의 singular values 계산 (batch로)
-        S_vals = torch.linalg.svdvals(S_batch)  # (neurons, n_per)
-        S_vals_clamped = S_vals.clamp(min=1e-12)
-        
-        # Y eigenvalues = S_vals^2
-        Y_eigs = S_vals_clamped ** 2
-        y_max_per_neuron = Y_eigs.max(dim=-1).values  # (neurons,)
-        y_min_per_neuron = Y_eigs.min(dim=-1).values  # (neurons,)
-        
-        cond_per_neuron = y_max_per_neuron / y_min_per_neuron.clamp(min=1e-12)
-        
-        # P eigenvalues = 1 / Y_eigs (same eigvecs, inverse vals)
-        # P_max = 1 / Y_min
-        p_max_per_neuron = 1.0 / y_min_per_neuron.clamp(min=1e-12)
-        
-        return (cond_per_neuron.mean().item(),
-                y_max_per_neuron.max().item(),   # 실제 Y_max
-                y_min_per_neuron.min().item(),   # 실제 Y_min
-                p_max_per_neuron.max().item())   # 실제 P_max (참고용)
-    except Exception:
-        return -1.0, -1.0, -1.0, -1.0
+    S_diag = torch.diagonal(S_batch, dim1=-2, dim2=-1).abs().clamp(min=1e-12)
+    Y_diag = 1.0 / (S_diag ** 2)  # (neurons, n_per)
+    y_max_per_neuron = Y_diag.max(dim=-1).values
+    y_min_per_neuron = Y_diag.min(dim=-1).values
+    cond_per_neuron = y_max_per_neuron / y_min_per_neuron.clamp(min=1e-12)
+    return (cond_per_neuron.mean().item(),
+            y_max_per_neuron.max().item(),
+            y_min_per_neuron.min().item())
 
 @torch.no_grad()
 def compute_full_cond_from_S(S_batch):
-    """
-    Y = S · S^T 이고, eigvals(S·S^T) = (singular values of S)^2.
-    """
+    """Full eigenvalue 기반 정확한 cond (비용 높음)"""
     try:
         SST = torch.bmm(S_batch, S_batch.transpose(-2, -1))
-        eigvals_Y = torch.linalg.eigvalsh(SST)  # Y의 eigenvalue (ascending)
-        y_max = eigvals_Y[:, -1].clamp(min=1e-12)  # 마지막이 max
-        y_min = eigvals_Y[:, 0].clamp(min=1e-12)   # 첫 번째가 min
+        eigvals_SST = torch.linalg.eigvalsh(SST)  # ascending
+        y_max = 1.0 / eigvals_SST[:, 0].clamp(min=1e-12)
+        y_min = 1.0 / eigvals_SST[:, -1].clamp(min=1e-12)
         cond = y_max / y_min.clamp(min=1e-12)
         return cond.mean().item(), y_max.max().item()
     except Exception:
@@ -518,6 +431,7 @@ def compute_full_cond_from_S(S_batch):
 
 @torch.no_grad()
 def compute_effective_rank(X, tol_ratio=1e-3):
+    """X: (dim, batch) or (batch, dim). SVD 기반 effective rank + stable rank."""
     if X.shape[0] > X.shape[1]:
         X = X.t()
     try:
@@ -534,6 +448,7 @@ def compute_effective_rank(X, tol_ratio=1e-3):
 
 @torch.no_grad()
 def compute_advantage_null_ratio(theta, info):
+    """A1 (advantage 마지막 레이어)의 null vs signal component"""
     adv_layers = [L for L in info['nd_layers'] if L['type'] == 'advantage']
     if not adv_layers:
         return 0.0, 0.0, 0.0
@@ -546,8 +461,9 @@ def compute_advantage_null_ratio(theta, info):
     W = theta_flat[W_start:W_start + W_len].view(fan_out, fan_in)
     b = theta_flat[b_start:b_start + b_len]
     
-    W_mean = W.mean(dim=0)
-    W_dev = W - W_mean.unsqueeze(0)
+    # null: 모든 action 뉴런이 같은 방향. signal: 뉴런간 deviation
+    W_mean = W.mean(dim=0)          # (fan_in,) per-input null component
+    W_dev = W - W_mean.unsqueeze(0) # (nA, fan_in)
     
     null_norm = W_mean.norm().item()
     signal_norm = W_dev.norm().item()
@@ -561,6 +477,7 @@ def compute_advantage_null_ratio(theta, info):
 
 @torch.no_grad()
 def compute_layer_theta_norms(theta, info):
+    """Layer별 parameter norm dict"""
     norms = {}
     theta_flat = theta.squeeze()
     for L, nd_layer in enumerate(info['nd_layers']):
@@ -574,79 +491,22 @@ def compute_layer_theta_norms(theta, info):
         norms[label] = (W_norm ** 2 + b_norm ** 2) ** 0.5
     return norms
 
-# ===================================================================
-# NEW: Buffer Diversity Diagnostics
-# ===================================================================
-@torch.no_grad()
-def compute_buffer_diversity(buffer, n_sample=512):
-    """
-    Buffer 내 데이터 다양성 지표:
-    - state_std: 각 state dim의 std 평균 (분포 분산)
-    - state_range: max-min 평균 (분포 범위)
-    - done_ratio: terminal sample 비율
-    - reward_mean, reward_std: reward 통계
-    - age_range: 샘플들의 ep_id 범위 (얼마나 다양한 에피소드에서 왔나)
-    - age_std: ep_id의 std
-    """
-    if buffer.current_size < 32:
-        return None
-    
-    n = min(n_sample, buffer.current_size)
-    indices = torch.randperm(buffer.current_size, device=buffer.device)[:n]
-    
-    states = buffer.S[indices]  # (n, dimS)
-    rewards = buffer.R[indices]
-    dones = buffer.term[indices]
-    ep_ids = buffer.ep_id[indices].float()
-    
-    # State diversity
-    state_std = states.std(dim=0).mean().item()
-    state_range = (states.max(dim=0).values - states.min(dim=0).values).mean().item()
-    
-    # Terminal/reward stats
-    done_ratio = dones.mean().item()
-    reward_mean = rewards.mean().item()
-    reward_std = rewards.std().item()
-    
-    # Age diversity (ep_id 분포)
-    age_min = ep_ids.min().item()
-    age_max = ep_ids.max().item()
-    age_range_val = age_max - age_min
-    age_std = ep_ids.std().item() if n > 1 else 0.0
-    
-    # Buffer state
-    fill_ratio = buffer.fill_ratio
-    is_sat = buffer.is_saturated
-    
-    return {
-        'state_std': state_std,
-        'state_range': state_range,
-        'done_ratio': done_ratio,
-        'reward_mean': reward_mean,
-        'reward_std': reward_std,
-        'age_min': int(age_min),
-        'age_max': int(age_max),
-        'age_range': age_range_val,
-        'age_std': age_std,
-        'fill_ratio': fill_ratio,
-        'is_saturated': is_sat,
-    }
-
-# Reference states
+# CartPole 고정 reference states
 REF_STATES = torch.tensor([
-    [0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.05, 0.0],
-    [0.0, 0.0, -0.05, 0.0],
-    [0.0, 0.0, 0.1, 0.5],
-    [0.0, 0.0, -0.1, -0.5],
+    [0.0, 0.0, 0.0, 0.0],       # 완전 균형
+    [0.0, 0.0, 0.05, 0.0],      # 약간 기울어짐 (R)
+    [0.0, 0.0, -0.05, 0.0],     # 약간 기울어짐 (L)
+    [0.0, 0.0, 0.1, 0.5],       # 떨어지는 중 (R)
+    [0.0, 0.0, -0.1, -0.5],     # 떨어지는 중 (L)
 ], dtype=DTYPE)
 REF_NAMES = ["balance", "tilt_R", "tilt_L", "fall_R", "fall_L"]
 
 @torch.no_grad()
 def compute_ref_q_values(theta, info, normalizer, device):
+    """5개 reference state에서 Q, ΔQ 계산"""
     ref = REF_STATES.to(device)
     ref_norm = normalizer.normalize(ref) if normalizer else ref
-    Q = forward_single(theta.squeeze(), info, ref_norm.t())
+    Q = forward_single(theta.squeeze(), info, ref_norm.t())  # (nA, n_refs)
     results = {}
     for i, name in enumerate(REF_NAMES):
         q0 = Q[0, i].item()
@@ -689,14 +549,8 @@ def _nd_compute_ht_core(Z_sigma_T_f32, Wm_col_f32, Wc_f32, zero_col_f32,
     
     return HT_all, residual_all, z_hat_f64, ht_norm, resid_norm
 
-def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all, 
-                            r_inv_sqrt, r_inv, eye_batch, tikhonov_sqrt=0.0):
-    if tikhonov_sqrt > 0:
-        combined = torch.cat([S_pred, HT_all * r_inv_sqrt, tikhonov_sqrt * eye_batch], dim=2)
-    else:
-        combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
-
-    #combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
+def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all, r_inv_sqrt, r_inv, eye_batch):
+    combined = torch.cat([S_pred, HT_all * r_inv_sqrt], dim=2)
     S_new_all = tria_operation_batch(combined)
     
     ht_theta = torch.bmm(HT_all.transpose(1, 2), theta_3d)
@@ -748,6 +602,9 @@ def initialize_theta(info, device):
 @torch.no_grad()
 def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
                      is_first, p_init_val, nd_cache, q_next_target_cached=None):
+    """
+    SRRHUIF-ND step with per-horizon layer-wise cond/Y_max diagnostics.
+    """
     device, info, batch_sz = sp['device'], sp['info'], sp['batch_sz']
     theta_prior = (theta_target if is_first else theta_current_in).clone()
     theta_current = theta_current_in.clone()
@@ -759,10 +616,11 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         s_batch = sp['normalizer'].normalize(s_batch)
         s_next = sp['normalizer'].normalize(s_next)
 
-    # s_batch = s_batch + torch.randn_like(s_batch) * 0.02
+    s_batch = s_batch + torch.randn_like(s_batch) * 0.02
     unified = nd_cache.unified_thetas
     unified[:] = theta_current.squeeze().to(DTYPE_FWD)
 
+    # Phase 1: Time Update
     per_layer = {}
     for L in range(info['num_nd_layers']):
         nd_layer = info['nd_layers'][L]
@@ -820,6 +678,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         layer_view.scatter_(dim=2, index=lc['w_col_idx'], src=X_sigma_f32[:, :, :pl['fan_in']])
         layer_view.scatter_(dim=2, index=lc['b_col_idx'], src=X_sigma_f32[:, :, pl['fan_in']:pl['fan_in'] + 1])
 
+    # Phase 2: z_measured
     if q_next_target_cached is not None:
         if is_first and cfg.use_spas:
             Q_sigma_f32 = forward_bmm(unified, info, s_next)
@@ -847,6 +706,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
     z_measured = (batch['r'] + cfg.gamma * (1 - batch['term']) * q_val_next).view(-1, 1)
     target_var = torch.var(z_measured).item()
 
+    # Phase 3: H computation
     Q_all_f32 = forward_bmm(unified, info, s_batch)
     
     for L in range(info['num_nd_layers']):
@@ -868,6 +728,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         per_layer[L]['resid_norm'] = resid_norm
         layer_count += 1
 
+    # Phase 4: Measurement Update + PER-LAYER COND DIAGNOSTICS
     total_innov_mean = 0.0
     total_innov_max = 0.0
     total_ht_norm = 0.0
@@ -881,6 +742,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
     total_y_pred_norm = 0.0
     group_count = 0
     
+    # === DIAGNOSTIC: per-layer cond/Y_max ===
     per_layer_cond = {}
     per_layer_ymax = {}
     per_layer_cond_full = {} if cfg.use_full_eigvalsh else None
@@ -897,8 +759,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
 
         theta_new_g, S_new_g, meas_stats = _nd_meas_update_core(
             all_S_pred, all_y_pred, all_HT, all_theta_3d,
-            all_residual, cfg.r_inv_sqrt, cfg.r_inv, grp['eye_grouped'],
-            tikhonov_sqrt=cfg.tikhonov_sqrt)
+            all_residual, cfg.r_inv_sqrt, cfg.r_inv, grp['eye_grouped'])
 
         total_innov_mean += meas_stats['innov_mean'].item()
         total_innov_max = max(total_innov_max, meas_stats['innov_max'].item())
@@ -922,10 +783,11 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
             theta_new_L = theta_new_g[s:e]
             S_new_L = S_new_g[s:e]
             
+            # === DIAGNOSTIC: cond/Y_max per layer ===
             if cfg.diag_horizon_cond:
                 nd = info['nd_layers'][L]
                 label = f"{nd['type'][0].upper()}{nd['local_idx']}"
-                cond_val, ymax_val, ymin_val, pmax_val = compute_pseudo_cond_from_S(S_new_L)
+                cond_val, ymax_val, ymin_val = compute_pseudo_cond_from_S(S_new_L)
                 per_layer_cond[label] = cond_val
                 per_layer_ymax[label] = ymax_val
                 
@@ -991,6 +853,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
         'innov_norm': total_innov_norm / gc,
         'per_layer_ht': per_layer_ht,
         'per_layer_delta': per_layer_delta,
+        # === NEW ===
         'per_layer_cond': per_layer_cond,
         'per_layer_ymax': per_layer_ymax,
         'per_layer_cond_full': per_layer_cond_full,
@@ -999,7 +862,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
     return theta_current, new_S_info, (total_loss / layer_count).item(), target_var, k_gain_norm, debug_stats
 
 # =========================================================================
-# 10. Live Plotter
+# 10. Live Plotter (기존 6-subplot + 진단 플롯)
 # =========================================================================
 class LivePlotter:
     def __init__(self, method_name: str, max_episodes: int, param_str: str = ""):
@@ -1011,7 +874,8 @@ class LivePlotter:
         self.q_vals_0, self.q_vals_1 = [], []
         self.total_time, self.avg_step_time = 0.0, 0.0
         
-        self.cond_history = {}
+        # === Diagnostic tracking ===
+        self.cond_history = {}       # label -> [ep-avg cond over updates]
         self.ymax_history = {}
         self.theta_norm_history = {}
         self.null_ratio_history = []
@@ -1019,16 +883,6 @@ class LivePlotter:
         self.stable_rank_history = []
         self.argmax_flip_history = []
         self.ref_dq_history = {name: [] for name in REF_NAMES}
-        
-        # === NEW: Buffer diversity history ===
-        self.buf_state_std = []
-        self.buf_state_range = []
-        self.buf_done_ratio = []
-        self.buf_reward_std = []
-        self.buf_fill_ratio = []
-        self.buf_age_range = []
-        self.buf_age_std = []
-        self.buf_saturated_ep = None  # 언제 처음 가득찼는지
         
         self.fig, self.axes = plt.subplots(1, 6, figsize=(30, 4))
         
@@ -1100,31 +954,6 @@ class LivePlotter:
             for name in REF_NAMES:
                 self.ref_dq_history[name].append(ref_q[name]['dq'])
     
-    def add_buffer_diag(self, buf_info, ep):
-        """Buffer 진단 기록"""
-        if buf_info is None:
-            # Buffer 너무 작을 때도 길이 맞추기 위해 NaN 삽입
-            self.buf_state_std.append(float('nan'))
-            self.buf_state_range.append(float('nan'))
-            self.buf_done_ratio.append(float('nan'))
-            self.buf_reward_std.append(float('nan'))
-            self.buf_fill_ratio.append(0.0)
-            self.buf_age_range.append(0)
-            self.buf_age_std.append(0.0)
-            return
-        
-        self.buf_state_std.append(buf_info['state_std'])
-        self.buf_state_range.append(buf_info['state_range'])
-        self.buf_done_ratio.append(buf_info['done_ratio'])
-        self.buf_reward_std.append(buf_info['reward_std'])
-        self.buf_fill_ratio.append(buf_info['fill_ratio'])
-        self.buf_age_range.append(buf_info['age_range'])
-        self.buf_age_std.append(buf_info['age_std'])
-        
-        # 최초 포화 시점 기록
-        if buf_info['is_saturated'] and self.buf_saturated_ep is None:
-            self.buf_saturated_ep = ep
-    
     def refresh(self):
         ep_range = range(len(self.rewards))
         self.line_r_raw.set_data(ep_range, self.rewards)
@@ -1147,11 +976,13 @@ class LivePlotter:
         plt.savefig(f'{self.filename}_live.png', dpi=100)
     
     def save_diagnostic_plots(self):
+        """종료 후 진단 플롯 저장"""
         if not self.cond_history and not self.theta_norm_history:
             return
         
         fig, axes = plt.subplots(2, 3, figsize=(21, 11))
         
+        # (0,0) Pseudo condition number per layer
         ax = axes[0, 0]
         for label, vals in sorted(self.cond_history.items()):
             ax.plot(vals, label=label, linewidth=1.5)
@@ -1162,6 +993,7 @@ class LivePlotter:
         ax.legend(loc='upper left', fontsize=8)
         ax.grid(True, alpha=0.3)
         
+        # (0,1) Y_max per layer
         ax = axes[0, 1]
         for label, vals in sorted(self.ymax_history.items()):
             ax.plot(vals, label=label, linewidth=1.5)
@@ -1171,6 +1003,7 @@ class LivePlotter:
         ax.legend(loc='upper left', fontsize=8)
         ax.grid(True, alpha=0.3)
         
+        # (0,2) Layer theta norm
         ax = axes[0, 2]
         for label, vals in sorted(self.theta_norm_history.items()):
             ax.plot(vals, label=label, linewidth=1.5)
@@ -1179,20 +1012,23 @@ class LivePlotter:
         ax.legend(loc='upper left', fontsize=8)
         ax.grid(True, alpha=0.3)
         
+        # (1,0) Null ratio
         ax = axes[1, 0]
         ax.plot(self.null_ratio_history, 'r-', linewidth=2)
-        ax.set_title('Advantage Null/Signal Ratio')
+        ax.set_title('Advantage Null/Signal Ratio\n(Dueling identifiability; higher=worse)')
         ax.set_xlabel('Episode')
         ax.grid(True, alpha=0.3)
         
+        # (1,1) Effective / Stable rank
         ax = axes[1, 1]
         ax.plot(self.eff_rank_history, 'b-', linewidth=2, label='effective rank')
         ax.plot(self.stable_rank_history, 'g--', linewidth=2, label='stable rank')
-        ax.set_title('Shared Output Rank')
+        ax.set_title('Shared Output Rank\n(low=feature collapse)')
         ax.set_xlabel('Episode')
         ax.legend()
         ax.grid(True, alpha=0.3)
         
+        # (1,2) Reference states ΔQ
         ax = axes[1, 2]
         for name in REF_NAMES:
             ax.plot(self.ref_dq_history[name], label=name, linewidth=1.5)
@@ -1207,6 +1043,7 @@ class LivePlotter:
         plt.close(fig)
         print(f"[*] 진단 플롯 저장: {self.filename}_diagnostics.png")
         
+        # Argmax flip 별도 플롯
         if self.argmax_flip_history:
             fig2, ax2 = plt.subplots(figsize=(10, 4))
             ax2.plot(self.argmax_flip_history, 'orange', linewidth=1.5)
@@ -1219,83 +1056,12 @@ class LivePlotter:
             plt.tight_layout()
             plt.savefig(f'{self.filename}_argmax_flip.png', dpi=120)
             plt.close(fig2)
-        
-        # === NEW: Buffer diagnostic plot ===
-        if self.buf_state_std and any(not (np.isnan(v)) for v in self.buf_state_std):
-            fig3, axes3 = plt.subplots(2, 3, figsize=(21, 10))
-            
-            # (0,0) Buffer fill ratio
-            ax = axes3[0, 0]
-            ax.plot(self.buf_fill_ratio, 'b-', linewidth=2)
-            if self.buf_saturated_ep is not None:
-                ax.axvline(x=self.buf_saturated_ep, color='r', linestyle='--', 
-                          label=f'First saturation: Ep {self.buf_saturated_ep}')
-                ax.legend()
-            ax.set_title('Buffer Fill Ratio')
-            ax.set_xlabel('Episode')
-            ax.set_ylim(0, 1.05)
-            ax.grid(True, alpha=0.3)
-            
-            # (0,1) State diversity
-            ax = axes3[0, 1]
-            ax.plot(self.buf_state_std, 'g-', linewidth=2, label='state_std')
-            if self.buf_saturated_ep is not None:
-                ax.axvline(x=self.buf_saturated_ep, color='r', linestyle='--', alpha=0.5)
-            ax.set_title('State Std (diversity of sampled states)')
-            ax.set_xlabel('Episode')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # (0,2) State range
-            ax = axes3[0, 2]
-            ax.plot(self.buf_state_range, 'm-', linewidth=2, label='state_range')
-            if self.buf_saturated_ep is not None:
-                ax.axvline(x=self.buf_saturated_ep, color='r', linestyle='--', alpha=0.5)
-            ax.set_title('State Range (max-min)')
-            ax.set_xlabel('Episode')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            # (1,0) Done ratio
-            ax = axes3[1, 0]
-            ax.plot(self.buf_done_ratio, 'orange', linewidth=2)
-            if self.buf_saturated_ep is not None:
-                ax.axvline(x=self.buf_saturated_ep, color='r', linestyle='--', alpha=0.5)
-            ax.set_title('Done Ratio in Buffer')
-            ax.set_xlabel('Episode')
-            ax.set_ylabel('Fraction of terminal states')
-            ax.grid(True, alpha=0.3)
-            
-            # (1,1) Reward std
-            ax = axes3[1, 1]
-            ax.plot(self.buf_reward_std, 'purple', linewidth=2)
-            if self.buf_saturated_ep is not None:
-                ax.axvline(x=self.buf_saturated_ep, color='r', linestyle='--', alpha=0.5)
-            ax.set_title('Reward Std in Buffer')
-            ax.set_xlabel('Episode')
-            ax.grid(True, alpha=0.3)
-            
-            # (1,2) Buffer age diversity
-            ax = axes3[1, 2]
-            ax.plot(self.buf_age_range, 'teal', linewidth=2, label='age range')
-            ax.plot(self.buf_age_std, 'brown', linewidth=2, label='age std')
-            if self.buf_saturated_ep is not None:
-                ax.axvline(x=self.buf_saturated_ep, color='r', linestyle='--', alpha=0.5)
-            ax.set_title('Buffer Age Diversity (ep_id range/std)')
-            ax.set_xlabel('Episode')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            plt.savefig(f'{self.filename}_buffer_diag.png', dpi=120, bbox_inches='tight')
-            plt.close(fig3)
-            print(f"[*] Buffer 진단 플롯 저장: {self.filename}_buffer_diag.png")
     
     def close(self):
         plt.close(self.fig)
 
 # =========================================================================
-# 11. Landscape Visualization
+# 11. Landscape Visualization (unchanged)
 # =========================================================================
 def plot_cartpole_state_landscape(theta_star, info, cfg, normalizer, method_name, param_str, resolution=50):
     print(f"\n[Landscape] {method_name} 상태 공간 Q-지형 분석 중...")
@@ -1334,7 +1100,7 @@ def plot_cartpole_state_landscape(theta_star, info, cfg, normalizer, method_name
     print(f"[*] 상태 공간 지형도 저장: {filename}")
 
 # =========================================================================
-# 12. Training Function
+# 12. Training Function (호라이즌별 진단 + 에피소드별 진단 통합)
 # =========================================================================
 def train_srrhuif_nd():
     set_all_seeds(cfg.seed)
@@ -1343,14 +1109,12 @@ def train_srrhuif_nd():
     info = create_network_info(dimS, nA, cfg)
     spas_str = "SPAS" if cfg.use_spas else "StdDQN"
     print(f"\n{'='*60}")
-    print(f"Training SRRHUIF-ND ({spas_str}) v9.0 | Params: {info['total_params']} ")
+    print(f"Training SRRHUIF-ND ({spas_str}) v8.0 | Params: {info['total_params']} ")
     print(f"Settings: [R={cfg.r_std}, α={cfg.alpha}, β={cfg.beta}, P={cfg.p_init}]")
     print(f"Horizon: {cfg.N_horizon}, Batch: {cfg.batch_size}, Q_std: {cfg.q_std}, τ: {cfg.tau_srrhuif}")
-    print(f"Buffer: {cfg.buffer_size}, update_interval: {cfg.update_interval}")
     print(f"Diagnostics: horizon_cond={cfg.diag_horizon_cond}, "
           f"full_eig={cfg.use_full_eigvalsh}, ref_Q={cfg.diag_ref_states}, "
-          f"argmax={cfg.diag_argmax_flip}, eff_rank={cfg.diag_eff_rank}, "
-          f"buffer_diag={cfg.diag_buffer}")
+          f"argmax={cfg.diag_argmax_flip}, eff_rank={cfg.diag_eff_rank}")
     print(f"{'='*60}")
 
     normalizer = InputNormalizer(cfg.device) if cfg.use_input_norm else None
@@ -1380,12 +1144,9 @@ def train_srrhuif_nd():
     theta_snapshots = {}
     
     prev_ep_delta = None
-    prev_buf_saturated = False  # 포화 전이 감지
 
     for ep in range(1, cfg.max_episodes + 1):
         s, _ = env.reset(seed=cfg.seed + ep)
-        buffer.set_current_episode(ep)  # NEW: 현재 에피소드 번호 기록
-        
         ep_r, ep_l, ep_var, ep_k_gain, ep_start = 0, [], [], [], time.time()
         ep_q0, ep_q1 = [], []
         ep_i_mean, ep_i_max = [], []
@@ -1398,11 +1159,12 @@ def train_srrhuif_nd():
         last_h_cos_traj = []
         last_h_layer_ht = []
         last_h_layer_delta = []
-        last_h_layer_cond = []
-        last_h_layer_ymax = []
+        last_h_layer_cond = []   # [h_idx][label] -> cond
+        last_h_layer_ymax = []   # [h_idx][label] -> ymax
         last_ep_cos = None
         
-        ep_cond_collect = {}
+        # episode-level cond/ymax aggregation (averaged over all updates in ep)
+        ep_cond_collect = {}   # label -> [cond values from h=last, per update]
         ep_ymax_collect = {}
         ep_argmax_flips = []
         
@@ -1412,13 +1174,7 @@ def train_srrhuif_nd():
 
         for t in range(cfg.max_steps):
             steps_done += 1
-
-            if steps_done <= cfg.warmup_step:
-                eps = 1.0  # 웜업 중에는 무조건 1.0 고정 (다양성 100% 확보)
-            else:
-                active_steps = steps_done - cfg.warmup_step
-                decay_ratio = np.exp(-active_steps / cfg.eps_decay_steps)
-                eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * decay_ratio
+            eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-steps_done / cfg.eps_decay_steps)
             
             with torch.no_grad():
                 s_t_buffer.copy_(torch.as_tensor(s, dtype=DTYPE))
@@ -1437,7 +1193,7 @@ def train_srrhuif_nd():
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
-            if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+            if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
                 update_start = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
                 batch_hist.append(batch)
@@ -1452,8 +1208,8 @@ def train_srrhuif_nd():
                     h_cos_traj = []
                     h_layer_ht = []
                     h_layer_delta = []
-                    h_layer_cond = []
-                    h_layer_ymax = []
+                    h_layer_cond = []    # NEW
+                    h_layer_ymax = []    # NEW
                     prev_h_delta = None
                     q_next_caches = []
                     with torch.no_grad():
@@ -1464,6 +1220,7 @@ def train_srrhuif_nd():
                             Q_tgt_h = forward_single(theta_target.squeeze(), info, s_next_h)
                             q_next_caches.append(Q_tgt_h)
 
+                    # === Argmax flip tracking: capture state before horizon
                     if cfg.diag_argmax_flip:
                         with torch.no_grad():
                             s_flip = batch_hist[0]['s'].t()
@@ -1503,9 +1260,11 @@ def train_srrhuif_nd():
                         h_innov_traj.append(dbg['innov_norm'])
                         h_layer_ht.append(dbg['per_layer_ht'])
                         h_layer_delta.append(dbg['per_layer_delta'])
+                        # NEW: per-layer cond/ymax per horizon step
                         h_layer_cond.append(dbg['per_layer_cond'])
                         h_layer_ymax.append(dbg['per_layer_ymax'])
 
+                    # === Argmax flip after horizon
                     if cfg.diag_argmax_flip:
                         with torch.no_grad():
                             Q_after = forward_single(theta.squeeze(), info, s_flip)
@@ -1513,6 +1272,7 @@ def train_srrhuif_nd():
                             flip = (argmax_before != argmax_after).float().mean().item()
                             ep_argmax_flips.append(flip)
                     
+                    # Aggregate cond/ymax over this update (use last horizon step)
                     if h_layer_cond:
                         last_cond_this_update = h_layer_cond[-1]
                         last_ymax_this_update = h_layer_ymax[-1]
@@ -1530,8 +1290,8 @@ def train_srrhuif_nd():
                     last_h_cos_traj = h_cos_traj
                     last_h_layer_ht = h_layer_ht
                     last_h_layer_delta = h_layer_delta
-                    last_h_layer_cond = h_layer_cond
-                    last_h_layer_ymax = h_layer_ymax
+                    last_h_layer_cond = h_layer_cond   # NEW
+                    last_h_layer_ymax = h_layer_ymax   # NEW
                     
                 update_times.append(time.perf_counter() - update_start) 
             if done or trunc: break
@@ -1546,6 +1306,7 @@ def train_srrhuif_nd():
         
         logger.add(ep_r, avg_l, p_init, avg_v, avg_k, avg_q0, avg_q1)
         
+        # === EPISODE-LEVEL DIAGNOSTICS ===
         theta_norms = compute_layer_theta_norms(theta, info)
         null_ratio, null_abs, signal_abs = compute_advantage_null_ratio(theta, info)
         
@@ -1571,18 +1332,6 @@ def train_srrhuif_nd():
                                null_ratio, eff_rank_val, stable_rank_val,
                                avg_argmax_flip, ref_q)
         
-        # === NEW: Buffer diversity ===
-        buf_info = None
-        if cfg.diag_buffer:
-            buf_info = compute_buffer_diversity(buffer)
-        logger.add_buffer_diag(buf_info, ep)
-        
-        # 포화 전이 감지 (최초 가득찬 다음 에피소드에 알림)
-        just_saturated = False
-        if buf_info is not None and buf_info['is_saturated'] and not prev_buf_saturated:
-            just_saturated = True
-            prev_buf_saturated = True
-        
         ep_delta = theta.squeeze() - theta_ep_start
         ep_delta_norm = torch.norm(ep_delta).item()
         if prev_ep_delta is not None and ep_delta_norm > 1e-10 and torch.norm(prev_ep_delta) > 1e-10:
@@ -1601,11 +1350,7 @@ def train_srrhuif_nd():
         if ep % cfg.plot_interval == 0: logger.refresh()
         if ep % cfg.log_interval == 0:
             recent = np.mean(logger.rewards[-20:]) if len(logger.rewards) >= 20 else np.mean(logger.rewards)
-            
-            # 포화 전이 표시
-            sat_marker = " 🔔BUF_SATURATED" if just_saturated else ""
-            
-            print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} "
+            print(f"[SRRHUIF] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {recent:6.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size} "
                   f"| Loss: {avg_l:.4f} | T_Var: {avg_v:.4f} | P: {p_init:.4f} | K_Gain: {avg_k:.4f} "
                   f"| Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | Time: {time.time()-ep_start:.2f}s")
 
@@ -1624,7 +1369,7 @@ def train_srrhuif_nd():
                     print(f"          └─▶ |H^Tθ|/h:  {fmt(h_parts)}")
                     print(f"          └─▶ |innov|/h:  {fmt(i_parts)}")
                 if last_h_cos_traj:
-                    print(f"          └─▶ cos(δ)/h:  {fmt2(last_h_cos_traj)}")
+                    print(f"          └─▶ cos(δ)/h:  {fmt2(last_h_cos_traj)}   ← 방향 일관성")
                 ep_cos_str = f"{last_ep_cos:+.3f}" if last_ep_cos is not None else "N/A"
                 print(f"          └─▶ ep_cos: {ep_cos_str} | θ-target drift: {target_drift:.4f} | ep_Δθ: {ep_delta_norm:.4f}")
                 
@@ -1643,8 +1388,12 @@ def train_srrhuif_nd():
                     dominant = max(max_ht_per_layer, key=max_ht_per_layer.get)
                     print(f"          └─▶ Dominant layer: {dominant} (max||H^T||={max_ht_per_layer[dominant]:.1f})")
             
+            # =====================================================================
+            # === NEW DIAGNOSTIC OUTPUT ===
+            # =====================================================================
             print(f"          ══ DIAGNOSTICS ══")
             
+            # 호라이즌별 cond/Y_max
             if last_h_layer_cond:
                 labels = sorted(last_h_layer_cond[0].keys())
                 
@@ -1656,28 +1405,23 @@ def train_srrhuif_nd():
                     ymax_str = " ".join([f"{l}={last_h_layer_ymax[h_idx][l]:.1e}" for l in labels])
                     print(f"          ├─▶ Y_max  h={h_idx}: {ymax_str}")
             
+            # Layer theta norms
             labels = sorted(theta_norms.keys())
             norm_str = " ".join([f"{l}={theta_norms[l]:.3f}" for l in labels])
             print(f"          ├─▶ ||θ|| per layer:   {norm_str}")
             
+            # Advantage null ratio
             print(f"          ├─▶ Adv null/signal:   ratio={null_ratio:.4f} (null={null_abs:.4f}, signal={signal_abs:.4f})")
             
+            # Shared eff rank
             if eff_rank_val > 0:
                 shared_dim = cfg.shared_layers[-1]
                 print(f"          ├─▶ Shared rank:       eff={eff_rank_val:.1f}/{shared_dim}, stable={stable_rank_val:.2f}")
             
+            # Argmax flip
             print(f"          ├─▶ Argmax flip rate:  {avg_argmax_flip:.4f} (updates={len(ep_argmax_flips)})")
             
-            # === NEW: Buffer diagnostics ===
-            if buf_info is not None:
-                sat_str = "YES" if buf_info['is_saturated'] else "no"
-                print(f"          ├─▶ Buffer diag:       fill={buf_info['fill_ratio']:.3f}({sat_str}) "
-                      f"state_std={buf_info['state_std']:.4f} state_range={buf_info['state_range']:.3f}")
-                print(f"          ├─▶ Buffer samples:    done_ratio={buf_info['done_ratio']:.4f} "
-                      f"r_std={buf_info['reward_std']:.4f} r_mean={buf_info['reward_mean']:.4f}")
-                print(f"          ├─▶ Buffer age:        ep[{buf_info['age_min']}..{buf_info['age_max']}] "
-                      f"range={buf_info['age_range']} std={buf_info['age_std']:.2f}")
-            
+            # Reference states
             if ref_q:
                 ref_str = " ".join([f"{name}:ΔQ={ref_q[name]['dq']:+.4f}(a={ref_q[name]['argmax']})" for name in REF_NAMES])
                 print(f"          └─▶ Ref states:        {ref_str}")
@@ -1696,24 +1440,14 @@ def train_srrhuif_nd():
     return logger
 
 def main():
-    # === NEW: 파일 로깅 설정 (main 시작 부분) ===
-    if cfg.save_file_log:
-        log_filepath = os.path.join(cfg.outdir, "training_log.txt")
-        setup_file_logging(log_filepath)
-    
-    try:
-        print(f"\n{'#' * 70}")
-        print(f"  SRRHUIF-ND v9.0 ({'SPAS' if cfg.use_spas else 'Standard'}) Buffer Diag Session")
-        print(f"  Horizon: {cfg.N_horizon} | Batch: {cfg.batch_size} | Q_std: {cfg.q_std}")
-        print(f"  Buffer: {cfg.buffer_size}")
-        print(f"  Output Dir: {cfg.outdir} | Prefix: {cfg.param_str}")
-        print(f"{'#' * 70}")
+    print(f"\n{'#' * 70}")
+    print(f"  SRRHUIF-ND v8.0 ({'SPAS' if cfg.use_spas else 'Standard'}) FullDiag Session")
+    print(f"  Horizon: {cfg.N_horizon} | Batch: {cfg.batch_size} | Q_std: {cfg.q_std}")
+    print(f"  Output Dir: {cfg.outdir} | Prefix: {cfg.param_str}")
+    print(f"{'#' * 70}")
 
-        srrhuif_log = train_srrhuif_nd()
-        print("\n[✔] 실험 및 시각화가 완료되었습니다.")
-    finally:
-        if cfg.save_file_log:
-            close_file_logging()
+    srrhuif_log = train_srrhuif_nd()
+    print("\n[✔] 실험 및 시각화가 완료되었습니다. (결과 폴더를 확인하세요!)")
 
 if __name__ == "__main__":
     main()
