@@ -116,12 +116,12 @@ class Config:
     gamma: float = 0.9
     scale_factor: float = 1.0
     
-    tau_srrhuif: float = 0.005
+    tau_srrhuif: float = 0.02
     N_horizon: int = 9
     q_std: float = 5e-4
     r_std: float = 2.0
 
-    alpha: float = 0.518
+    alpha: float = 0.5
     beta: float = 2.0   
     kappa: float = 0.0
     
@@ -134,11 +134,11 @@ class Config:
 
     eps_start: float = 0.99
     eps_end: float = 0.001
-    eps_decay_steps: int = 2000
+    eps_decay_steps: int = 800
 
-    warmup_step : int = 200
+    warmup_step : int = 256
 
-    update_interval: int = 1
+    update_interval: int = 4
     use_input_norm: bool = True
     use_compile: bool = True
     plot_interval: int = 50
@@ -1412,7 +1412,13 @@ def train_srrhuif_nd():
 
         for t in range(cfg.max_steps):
             steps_done += 1
-            eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-steps_done / cfg.eps_decay_steps)
+
+            if steps_done <= cfg.warmup_step:
+                eps = 1.0  # 웜업 중에는 무조건 1.0 고정 (다양성 100% 확보)
+            else:
+                active_steps = steps_done - cfg.warmup_step
+                decay_ratio = np.exp(-active_steps / cfg.eps_decay_steps)
+                eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * decay_ratio
             
             with torch.no_grad():
                 s_t_buffer.copy_(torch.as_tensor(s, dtype=DTYPE))
