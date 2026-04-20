@@ -104,7 +104,7 @@ JITTER = 1e-12
 class Config:
     env_name: str = "CartPole-v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    max_episodes: int = 120
+    max_episodes: int = 200
     max_steps: int = 500
     batch_size: int = 64
     buffer_size: int = 30000 #30000 CHANGEd 
@@ -116,17 +116,16 @@ class Config:
     gamma: float = 0.9
     scale_factor: float = 1.0
     
-    tau_srrhuif: float = 0.02
+    tau_srrhuif: float = 0.005
     N_horizon: int = 9
     q_std: float = 5e-4
     r_std: float = 2.0
 
-    alpha: float = 0.3
+    alpha: float = 0.518
     beta: float = 2.0   
     kappa: float = 0.0
     
-    tikhonov_lambda: float = 1e-4
-    
+    tikhonov_lambda: float = 0.0
     max_k_gain: float = 0.0
     
     p_init: float = 0.03
@@ -135,9 +134,11 @@ class Config:
 
     eps_start: float = 0.99
     eps_end: float = 0.001
-    eps_decay_steps: int = 3000
+    eps_decay_steps: int = 2000
 
-    update_interval: int = 4
+    warmup_step : int = 200
+
+    update_interval: int = 1
     use_input_norm: bool = True
     use_compile: bool = True
     plot_interval: int = 50
@@ -175,6 +176,7 @@ parser.add_argument('--horizon', type=int, default=cfg.N_horizon)
 parser.add_argument('--batch', type=int, default=cfg.batch_size)
 parser.add_argument('--q_std', type=float, default=cfg.q_std)
 parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
+parser.add_argument('--warmup_step', type=int, default=cfg.warmup_step)
 parser.add_argument('--value_layer_scale', type=float, default=cfg.value_layer_scale) 
 parser.add_argument('--use_full_eigvalsh', action='store_true', default=cfg.use_full_eigvalsh)
 parser.add_argument('--no_file_log', action='store_true', default=False)
@@ -192,6 +194,7 @@ cfg.q_std = args.q_std
 cfg.tau_srrhuif = args.tau
 cfg.value_layer_scale = args.value_layer_scale
 cfg.use_full_eigvalsh = args.use_full_eigvalsh
+cfg.warmup_step = args.warmup_step
 cfg.tikhonov_lambda = args.tikhonov
 
 if args.no_file_log:
@@ -1428,7 +1431,7 @@ def train_srrhuif_nd():
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
-            if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+            if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
                 update_start = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
                 batch_hist.append(batch)
