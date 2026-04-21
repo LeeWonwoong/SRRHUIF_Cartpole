@@ -23,10 +23,11 @@ matplotlib.use('Agg')
 =========================================================================
 SRRHUIF-D3QN vs Adam (Multi-Seed Benchmark Edition)
 =========================================================================
-- 5개 시드 연속 테스트 자동화
-- 순수 로직 검증: 인위적 Gating 배제, 순수 FIR 필터 업데이트만 수행
-- [Fix 1] Loss 정상 기록 (MSE)
-- [Fix 2] Adam Q-Target 차원 명시화 (dim=1)
+- v9.0과 100% 동일한 순수 로직 복구
+- [Fix 1] SRRHUIF NaN 방어막(isfinite check) 복구
+- [Fix 2] Adam Double DQN 로직 복구
+- [Fix 3] Adam Gradient Clipping (10.0) 복구
+- [Fix 4] Epsilon Decay & Update Trigger (Step 1부터 적용) 복구
 =========================================================================
 """
 
@@ -71,8 +72,7 @@ class Config:
     max_episodes: int = 120
     max_steps: int = 500
     batch_size: int = 64
-    buffer_size: int = 10000
-    warmup_step: int = 128
+    buffer_size: int = 20000
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
     value_layers: List[int] = field(default_factory=lambda: [4])
@@ -92,10 +92,11 @@ class Config:
     beta: float = 2.0   
     kappa: float = 0.0
     p_init: float = 0.03
-    tikhonov_lambda: float = 0.0
     
     # Adam 파라미터
     adam_lr: float = 3e-4
+    tau_adam: float = 0.005
+    
     eps_start: float = 0.99
     eps_end: float = 0.1
     eps_decay_steps: int = 3000
@@ -104,29 +105,10 @@ class Config:
     def __post_init__(self):
         self.r_inv_sqrt = 1.0 / self.r_std
         self.r_inv = 1.0 / (self.r_std ** 2)
-        self.tikhonov_sqrt = float(np.sqrt(self.tikhonov_lambda))
-        self.outdir = f"./results_multiseed_v9"
+        self.outdir = f"./results_multiseed_v9_pure"
         os.makedirs(self.outdir, exist_ok=True)
 
 cfg = Config()
-
-parser = argparse.ArgumentParser()
-parser.add_argument('--alpha', type=float, default=cfg.alpha)
-parser.add_argument('--beta', type=float, default=cfg.beta)
-parser.add_argument('--r_std', type=float, default=cfg.r_std)
-parser.add_argument('--p_init', type=float, default=cfg.p_init)
-parser.add_argument('--episodes', type=int, default=cfg.max_episodes)
-parser.add_argument('--horizon', type=int, default=cfg.N_horizon)
-parser.add_argument('--batch', type=int, default=cfg.batch_size)
-parser.add_argument('--q_std', type=float, default=cfg.q_std)
-parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
-parser.add_argument('--warmup_step', type=int, default=cfg.warmup_step)
-args, _ = parser.parse_known_args()
-
-cfg.alpha = args.alpha; cfg.beta = args.beta; cfg.r_std = args.r_std
-cfg.p_init = args.p_init; cfg.max_episodes = args.episodes
-cfg.N_horizon = args.horizon; cfg.batch_size = args.batch
-cfg.q_std = args.q_std; cfg.tau_srrhuif = args.tau; cfg.warmup_step = args.warmup_step
 cfg.__post_init__()
 
 # =========================================================================
@@ -435,6 +417,12 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp, is
         for i, L in enumerate(layers_in_grp):
             s, e = offsets[i], offsets[i + 1]
             theta_new_L = theta_new_g[s:e]
+            
+            # [Fix 1: NaN 방어막 복구 (v9 핵심 로직)]
+            invalid = ~torch.isfinite(theta_new_L).all(dim=(1, 2))
+            if invalid.any():
+                theta_new_L[invalid] = per_layer[L]['theta_all_prior_3d'][invalid]
+                
             W_new = theta_new_L[:, :per_layer[L]['fan_in'], 0]
             b_new = theta_new_L[:, per_layer[L]['fan_in'], 0]
             nd_layer = info['nd_layers'][L]
@@ -448,9 +436,6 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp, is
     new_S_info = [new_S_info_dict[L] for L in range(info['num_nd_layers'])]
     return theta_current, new_S_info
 
-# =========================================================================
-# Adam Baseline D3QN Module
-# =========================================================================
 # =========================================================================
 # Adam Baseline D3QN Module
 # =========================================================================
@@ -472,8 +457,7 @@ class AdamD3QN(nn.Module):
         
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # [Fix] randn_ 대신 normal_ 사용
-                nn.init.normal_(m.weight, mean=0.0, std=1.0) 
+                nn.init.normal_(m.weight, mean=0.0, std=1.0)
                 m.weight.data *= np.sqrt(2.0 / m.in_features)
                 nn.init.zeros_(m.bias)
 
@@ -529,28 +513,35 @@ def train_srrhuif_nd(seed: int, is_diag_seed: bool) -> RunLogger:
     steps_done = 0
 
     for ep in range(1, cfg.max_episodes + 1):
+        ep_start = time.time()
         s, _ = env.reset(seed=seed + ep)
         ep_r, ep_l = 0, []
+        ep_q0, ep_q1, ep_targets = 0.0, 0.0, []
+        step_count = 0
 
         for t in range(cfg.max_steps):
             steps_done += 1
-            if steps_done <= cfg.warmup_step: eps = 1.0
-            else: eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-(steps_done - cfg.warmup_step) / cfg.eps_decay_steps)
+            step_count += 1
+            
+            # [Fix 4: Epsilon Decay 시작점 v9과 100% 동일하게 복구 (웜업 제거)]
+            eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-steps_done / cfg.eps_decay_steps)
             
             with torch.no_grad():
                 s_t_buffer.copy_(torch.as_tensor(s, dtype=DTYPE))
                 q_vals = forward_single(theta.squeeze(), info, normalizer.normalize(s_t_buffer)).squeeze()
+                ep_q0 += q_vals[0].item()
+                ep_q1 += q_vals[1].item()
 
             a = env.action_space.sample() if np.random.rand() < eps else q_vals.argmax().item()
             ns, r, done, trunc, _ = env.step(a)
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
-            if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+            # [Fix 4: Update Trigger v9과 동일하게 복구 (buffer >= 64 즉시 시작)]
+            if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
                 update_start = time.perf_counter()
                 batch = buffer.sample_batch(cfg.batch_size)
                 
-                # [Fix 1] SRRHUIF의 TD-Loss 연산 및 로깅 (순수 기록용, 업데이트엔 영향 없음)
                 with torch.no_grad():
                     s_b = normalizer.normalize(batch['s'].t())
                     ns_b = normalizer.normalize(batch['s_next'].t())
@@ -560,8 +551,8 @@ def train_srrhuif_nd(seed: int, is_diag_seed: bool) -> RunLogger:
                     Q_curr_all = forward_single(theta.squeeze(), info, s_b)
                     q_v = Q_curr_all[batch['a'], torch.arange(cfg.batch_size, device=cfg.device)]
                     ep_l.append(F.mse_loss(q_v, target).item())
+                    ep_targets.extend(target.cpu().numpy())
 
-                # 순수 SRRHUIF 업데이트 로직
                 batch_hist.append(batch)
                 if len(batch_hist) == cfg.N_horizon:
                     q_next_caches = []
@@ -581,15 +572,19 @@ def train_srrhuif_nd(seed: int, is_diag_seed: bool) -> RunLogger:
 
             if done or trunc: break
 
-        # [Fix 1] Loss 정상 기록
         ep_loss_mean = np.mean(ep_l) if len(ep_l) > 0 else 0.0
+        avg_q0 = ep_q0 / step_count if step_count > 0 else 0.0
+        avg_q1 = ep_q1 / step_count if step_count > 0 else 0.0
+        avg_v = np.var(ep_targets) if len(ep_targets) > 0 else 0.0
+        sat_marker = "*" if buffer.current_size >= cfg.buffer_size else ""
+        
         logger.add(ep_r, ep_loss_mean)
         
         if ep >= 20 and np.mean(logger.rewards[-20:]) >= 490.0 and logger.converged_ep == -1:
             logger.converged_ep = ep
             
         if is_diag_seed and ep % 10 == 0:
-            print(f"[SRRHUIF|Seed {seed}] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {np.mean(logger.rewards[-20:]):.1f} | Loss: {ep_loss_mean:.4f}")
+            print(f"[SRRHUIF|Seed {seed:3d}] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {np.mean(logger.rewards[-20:]):.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} | Loss: {ep_loss_mean:.4f} | T_Var: {avg_v:.4f} | Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | Time: {time.time()-ep_start:.2f}s")
             
     if logger.converged_ep == -1: logger.converged_ep = cfg.max_episodes
     env.close()
@@ -612,24 +607,31 @@ def train_adam(seed: int, is_diag_seed: bool) -> RunLogger:
     steps_done = 0
 
     for ep in range(1, cfg.max_episodes + 1):
+        ep_start = time.time()
         s, _ = env.reset(seed=seed + ep)
         ep_r, ep_l = 0, []
+        ep_q0, ep_q1, ep_targets = 0.0, 0.0, []
+        step_count = 0
 
         for t in range(cfg.max_steps):
             steps_done += 1
-            if steps_done <= cfg.warmup_step: eps = 1.0
-            else: eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-(steps_done - cfg.warmup_step) / cfg.eps_decay_steps)
+            step_count += 1
+            
+            # [Fix 4: Epsilon Decay 동일 적용]
+            eps = cfg.eps_end + (cfg.eps_start - cfg.eps_end) * np.exp(-steps_done / cfg.eps_decay_steps)
             
             with torch.no_grad():
                 s_t = normalizer.normalize(torch.as_tensor(s, dtype=DTYPE, device=cfg.device).unsqueeze(0))
                 q_vals = net(s_t).squeeze()
+                ep_q0 += q_vals[0].item()
+                ep_q1 += q_vals[1].item()
 
             a = env.action_space.sample() if np.random.rand() < eps else q_vals.argmax().item()
             ns, r, done, trunc, _ = env.step(a)
             buffer.push(s, a, r / cfg.scale_factor, ns, done)
             s, ep_r = ns, ep_r + r
 
-            if steps_done > cfg.warmup_step and buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
+            if buffer.current_size >= cfg.batch_size and steps_done % cfg.update_interval == 0:
                 update_start = time.perf_counter()
                 
                 batch = buffer.sample_batch(cfg.batch_size)
@@ -637,34 +639,43 @@ def train_adam(seed: int, is_diag_seed: bool) -> RunLogger:
                 ns_b = normalizer.normalize(batch['s_next'].t())
                 
                 q_v = net(s_b).gather(1, batch['a'].unsqueeze(1)).squeeze(1)
+                
                 with torch.no_grad():
-                    # [Fix 2] dim=1 로 차원 명확히 고정하여 뷰(View) 충돌 방어
-                    next_q = target_net(ns_b).max(dim=1, keepdim=False)[0]
+                    # [Fix 2: Adam Double DQN 로직 복구]
+                    a_best = net(ns_b).argmax(dim=1)
+                    next_q = target_net(ns_b).gather(1, a_best.unsqueeze(1)).squeeze(1)
                     target = batch['r'] + cfg.gamma * (1 - batch['term']) * next_q
+                    ep_targets.extend(target.cpu().numpy())
                 
                 loss = F.mse_loss(q_v, target)
-                ep_l.append(loss.item())  # [Fix 1] Loss 정상 기록
+                ep_l.append(loss.item())
                 
                 optimizer.zero_grad()
                 loss.backward()
+                # [Fix 3: Adam Gradient Clipping 복구]
+                torch.nn.utils.clip_grad_norm_(net.parameters(), 10.0)
                 optimizer.step()
                 
                 for target_param, param in zip(target_net.parameters(), net.parameters()):
-                    target_param.data.copy_(cfg.tau_srrhuif * param.data + (1.0 - cfg.tau_srrhuif) * target_param.data)
+                    target_param.data.copy_(cfg.tau_adam * param.data + (1.0 - cfg.tau_adam) * target_param.data)
                 
                 logger.update_times_ms.append((time.perf_counter() - update_start) * 1000)
 
             if done or trunc: break
 
-        # [Fix 1] Loss 정상 기록
         ep_loss_mean = np.mean(ep_l) if len(ep_l) > 0 else 0.0
+        avg_q0 = ep_q0 / step_count if step_count > 0 else 0.0
+        avg_q1 = ep_q1 / step_count if step_count > 0 else 0.0
+        avg_v = np.var(ep_targets) if len(ep_targets) > 0 else 0.0
+        sat_marker = "*" if buffer.current_size >= cfg.buffer_size else ""
+        
         logger.add(ep_r, ep_loss_mean)
         
         if ep >= 20 and np.mean(logger.rewards[-20:]) >= 490.0 and logger.converged_ep == -1:
             logger.converged_ep = ep
             
         if is_diag_seed and ep % 10 == 0:
-            print(f"[Adam   |Seed {seed}] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {np.mean(logger.rewards[-20:]):.1f} | Loss: {ep_loss_mean:.4f}")
+            print(f"[Adam   |Seed {seed:3d}] Ep {ep:3d} | Rwd: {ep_r:6.1f} | Avg20: {np.mean(logger.rewards[-20:]):.1f} | eps: {eps:.2f} | Buf: {buffer.current_size}/{cfg.buffer_size}{sat_marker} | Loss: {ep_loss_mean:.4f} | T_Var: {avg_v:.4f} | Q(0): {avg_q0:.2f} | Q(1): {avg_q1:.2f} | Time: {time.time()-ep_start:.2f}s")
             
     if logger.converged_ep == -1: logger.converged_ep = cfg.max_episodes
     env.close()
@@ -718,7 +729,6 @@ def plot_multiseed_results(srrhuif_logs, adam_logs):
     ax2.set_xticks(x)
     ax2.set_xticklabels(['SRRHUIF-ND', 'Adam'])
     
-    # Twin axis for ms/step
     ax3 = ax2.twinx()
     ax3.plot(x, [s_ms, a_ms], 'ko-', markersize=8, linewidth=2, label='Update Time (ms/step)')
     ax3.set_ylabel('Time (ms) per Update Step')
@@ -738,9 +748,9 @@ def plot_multiseed_results(srrhuif_logs, adam_logs):
 def main():
     setup_file_logging(os.path.join(cfg.outdir, "benchmark_log.txt"))
     print(f"============================================================")
-    print(f"🚀 SRRHUIF-ND vs Adam Multi-Seed Benchmark (Pure Logic)")
+    print(f"🚀 SRRHUIF-ND vs Adam Multi-Seed Benchmark (v9 Pure Logic)")
     print(f"Seeds: {cfg.seeds}")
-    print(f"Settings: Warmup={cfg.warmup_step}, Batch={cfg.batch_size}, Horizon={cfg.N_horizon}")
+    print(f"Settings: Batch={cfg.batch_size}, Horizon={cfg.N_horizon}, R={cfg.r_std}, Q={cfg.q_std}")
     print(f"============================================================\n")
 
     srrhuif_logs = []
@@ -750,19 +760,17 @@ def main():
         is_diag = (seed == cfg.seeds[0])
         print(f"\n>>> Running Seed {seed} ...")
         
-        # 1. SRRHUIF
         start_t = time.time()
         s_log = train_srrhuif_nd(seed, is_diag)
         s_time = time.time() - start_t
         srrhuif_logs.append(s_log)
         
-        # 2. Adam
         start_t = time.time()
         a_log = train_adam(seed, is_diag)
         a_time = time.time() - start_t
         adam_logs.append(a_log)
         
-        print(f"   [Seed {seed} Done] SRRHUIF: {s_log.converged_ep} eps ({s_time:.1f}s) | Adam: {a_log.converged_ep} eps ({a_time:.1f}s)")
+        print(f"   [Seed {seed:3d} Done] SRRHUIF: {s_log.converged_ep} eps ({s_time:.1f}s) | Adam: {a_log.converged_ep} eps ({a_time:.1f}s)")
 
     plot_multiseed_results(srrhuif_logs, adam_logs)
 
