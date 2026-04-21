@@ -71,8 +71,8 @@ class Config:
     max_episodes: int = 120
     max_steps: int = 500
     batch_size: int = 64
-    buffer_size: int = 50000
-    warmup_step: int = 100
+    buffer_size: int = 10000
+    warmup_step: int = 128
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
     value_layers: List[int] = field(default_factory=lambda: [4])
@@ -97,7 +97,7 @@ class Config:
     # Adam 파라미터
     adam_lr: float = 3e-4
     eps_start: float = 0.99
-    eps_end: float = 0.001
+    eps_end: float = 0.1
     eps_decay_steps: int = 3000
     use_spas: bool = True  
     
@@ -451,6 +451,9 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp, is
 # =========================================================================
 # Adam Baseline D3QN Module
 # =========================================================================
+# =========================================================================
+# Adam Baseline D3QN Module
+# =========================================================================
 class AdamD3QN(nn.Module):
     def __init__(self, dimS, nA, cfg):
         super().__init__()
@@ -469,7 +472,8 @@ class AdamD3QN(nn.Module):
         
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.randn_(m.weight)
+                # [Fix] randn_ 대신 normal_ 사용
+                nn.init.normal_(m.weight, mean=0.0, std=1.0) 
                 m.weight.data *= np.sqrt(2.0 / m.in_features)
                 nn.init.zeros_(m.bias)
 
