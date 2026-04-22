@@ -76,7 +76,7 @@ def set_all_seeds(seed: int):
 torch.set_default_dtype(torch.float64)
 DTYPE = torch.float64
 DTYPE_FWD = torch.float32
-JITTER = 1e-12
+JITTER = 1e-8
 
 # =========================================================================
 # 1. Configuration
@@ -97,16 +97,16 @@ class Config:
     gamma: float = 0.94
     scale_factor: float = 1.0
     
-    tau_srrhuif: float = 0.005
+    tau_srrhuif: float = 0.02
     N_horizon: int = 9
-    q_std: float = 5e-4
-    r_std: float = 2
+    q_std: float = 5e-3
+    r_std: float = 2.0
 
-    alpha: float = 0.518
+    alpha: float = 0.5
     beta: float = 2.0   
     kappa: float = 0.0
     
-    tikhonov_lambda: float = 0
+    tikhonov_lambda: float = 1e-8
     max_k_gain: float = 0.0
     
     p_init: float = 0.03
@@ -114,11 +114,10 @@ class Config:
 
     eps_start: float = 0.99
     eps_end: float = 0.1
-    eps_decay_steps: int = 3000
+    eps_decay_steps: int = 2000
 
     warmup_step : int = 0
-
-    update_interval: int = 1
+    update_interval: int = 4
     use_input_norm: bool = True
     use_compile: bool = True
     plot_interval: int = 30
@@ -428,11 +427,21 @@ class TensorReplayBuffer:
                 's_next': self.S_next[indices].t(), 'term': self.term[indices]}
 
 def tria_operation_batch(A):
+    # 1. QR Decomposition
     _, r = torch.linalg.qr(A.transpose(-2, -1).contiguous())
     s = r.transpose(-2, -1).contiguous()
+    
     d = torch.diagonal(s, dim1=-2, dim2=-1)
+    
     signs = torch.where(d >= 0, torch.ones_like(d), -torch.ones_like(d))
-    return s * signs.unsqueeze(-1)
+    s = s * signs.unsqueeze(-2)
+    
+    d_positive = torch.diagonal(s, dim1=-2, dim2=-1)
+    d_clamped = torch.clamp(d_positive, min=1e-7)
+
+    s = s - torch.diag_embed(d_positive) + torch.diag_embed(d_clamped)
+    
+    return s
 
 def safe_inv_tril_batch(L_batch, eye_batch):
     result = torch.linalg.solve_triangular(L_batch + JITTER * eye_batch, eye_batch, upper=False)
@@ -463,18 +472,18 @@ def compute_pseudo_cond_from_S(S_batch):
     try:
         # S의 singular values 계산 (batch로)
         S_vals = torch.linalg.svdvals(S_batch)  # (neurons, n_per)
-        S_vals_clamped = S_vals.clamp(min=1e-12)
+        S_vals_clamped = S_vals.clamp(min=1e-7)
         
         # Y eigenvalues = S_vals^2
         Y_eigs = S_vals_clamped ** 2
         y_max_per_neuron = Y_eigs.max(dim=-1).values  # (neurons,)
         y_min_per_neuron = Y_eigs.min(dim=-1).values  # (neurons,)
         
-        cond_per_neuron = y_max_per_neuron / y_min_per_neuron.clamp(min=1e-12)
+        cond_per_neuron = y_max_per_neuron / y_min_per_neuron.clamp(min=1e-7)
         
         # P eigenvalues = 1 / Y_eigs (same eigvecs, inverse vals)
         # P_max = 1 / Y_min
-        p_max_per_neuron = 1.0 / y_min_per_neuron.clamp(min=1e-12)
+        p_max_per_neuron = 1.0 / y_min_per_neuron.clamp(min=1e-7)
         
         return (cond_per_neuron.mean().item(),
                 y_max_per_neuron.max().item(),   # 실제 Y_max
@@ -491,9 +500,9 @@ def compute_full_cond_from_S(S_batch):
     try:
         SST = torch.bmm(S_batch, S_batch.transpose(-2, -1))
         eigvals_Y = torch.linalg.eigvalsh(SST)  # Y의 eigenvalue (ascending)
-        y_max = eigvals_Y[:, -1].clamp(min=1e-12)  # 마지막이 max
-        y_min = eigvals_Y[:, 0].clamp(min=1e-12)   # 첫 번째가 min
-        cond = y_max / y_min.clamp(min=1e-12)
+        y_max = eigvals_Y[:, -1].clamp(min=1e-7)  # 마지막이 max
+        y_min = eigvals_Y[:, 0].clamp(min=1e-7)   # 첫 번째가 min
+        cond = y_max / y_min.clamp(min=1e-7)
         return cond.mean().item(), y_max.max().item()
     except Exception:
         return -1.0, -1.0
@@ -506,7 +515,7 @@ def compute_effective_rank(X, tol_ratio=1e-3):
         X_centered = X - X.mean(dim=0, keepdim=True)
         s = torch.linalg.svdvals(X_centered)
         s_max = s.max()
-        if s_max < 1e-12:
+        if s_max < 1e-7:
             return 0.0, 0.0
         eff_rank = (s > s_max * tol_ratio).sum().item()
         stable_rank = (s ** 2).sum().item() / (s_max ** 2).item()
@@ -538,7 +547,7 @@ def compute_advantage_null_ratio(theta, info):
     
     null_total = (null_norm ** 2 + b_mean ** 2) ** 0.5
     signal_total = (signal_norm ** 2 + b_dev_norm ** 2) ** 0.5
-    ratio = null_total / (signal_total + 1e-12)
+    ratio = null_total / (signal_total + 1e-7)
     return ratio, null_total, signal_total
 
 @torch.no_grad()
@@ -701,7 +710,7 @@ def _nd_meas_update_core(S_pred, y_pred, HT_all, theta_3d, residual_all,
     theta_new_all = robust_solve_spd_batch(S_new_all, y_new_all, eye_batch)
     
     S_diag = torch.diagonal(S_new_all, dim1=-2, dim2=-1)
-    P_approx = 1.0 / (S_diag ** 2 + 1e-12)
+    P_approx = 1.0 / (S_diag ** 2 + 1e-7)
     avg_P_new = P_approx.mean().item()
     
     meas_stats = {
@@ -1053,7 +1062,7 @@ class LivePlotter:
     
     def add(self, reward, loss, p_init=0.0, z_var=0.0, k_gain=0.0, q0=0.0, q1=0.0): 
         self.rewards.append(reward)
-        self.losses.append(max(loss, 1e-10))
+        self.losses.append(max(loss, 1e-7))
         self.p_inits.append(p_init)
         self.z_vars.append(z_var)
         self.k_gains.append(k_gain) 
@@ -1464,7 +1473,7 @@ def train_srrhuif_nd():
                         if prev_h_delta is not None:
                             d_norm = torch.norm(h_delta)
                             p_norm = torch.norm(prev_h_delta)
-                            if d_norm > 1e-10 and p_norm > 1e-10:
+                            if d_norm > 1e-7 and p_norm > 1e-7:
                                 cos = F.cosine_similarity(h_delta.unsqueeze(0), prev_h_delta.unsqueeze(0)).item()
                             else:
                                 cos = 0.0
@@ -1564,7 +1573,7 @@ def train_srrhuif_nd():
         
         ep_delta = theta.squeeze() - theta_ep_start
         ep_delta_norm = torch.norm(ep_delta).item()
-        if prev_ep_delta is not None and ep_delta_norm > 1e-10 and torch.norm(prev_ep_delta) > 1e-10:
+        if prev_ep_delta is not None and ep_delta_norm > 1e-7 and torch.norm(prev_ep_delta) > 1e-7:
             last_ep_cos = F.cosine_similarity(ep_delta.unsqueeze(0), prev_ep_delta.unsqueeze(0)).item()
         else:
             last_ep_cos = None
