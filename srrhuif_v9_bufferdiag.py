@@ -18,25 +18,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 matplotlib.use('Agg')
 
-"""
-=========================================================================
-SRRHUIF-D3QN v9.0: Buffer Diversity + File Logging
-=========================================================================
-v8 기반 + 추가:
-  [Buffer diversity tracking (매 에피소드)]
-    - state_std, state_range: state 분포 다양성
-    - done_ratio: buffer 내 terminal sample 비율
-    - reward_std: reward 분산
-    - buffer_fill_ratio: 버퍼 채움률
-    - is_saturated: 버퍼 최초 가득찬 에피소드 추적
-
-  [로그 파일 저장]
-    - stdout + 파일 동시 기록
-    - {outdir}/training_log.txt 자동 생성
-    - print() → log() 함수로 통일
-=========================================================================
-"""
-
 # =========================================================================
 # Dual Output Logger (console + file)
 # =========================================================================
@@ -104,44 +85,43 @@ JITTER = 1e-12
 class Config:
     env_name: str = "CartPole-v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    max_episodes: int = 200
+    max_episodes: int = 120
     max_steps: int = 500
     batch_size: int = 64
-    buffer_size: int = 30000 #30000 CHANGEd 
+    buffer_size: int = 15000
 
     shared_layers: List[int] = field(default_factory=lambda: [16, 16])
     value_layers: List[int] = field(default_factory=lambda: [4])
     advantage_layers: List[int] = field(default_factory=lambda: [4])
 
-    gamma: float = 0.99
+    gamma: float = 0.94
     scale_factor: float = 1.0
     
-    tau_srrhuif: float = 0.02
+    tau_srrhuif: float = 0.005
     N_horizon: int = 9
     q_std: float = 5e-4
-    r_std: float = 2.0
+    r_std: float = 2
 
     alpha: float = 0.518
     beta: float = 2.0   
     kappa: float = 0.0
     
-    tikhonov_lambda: float = 0.0
+    tikhonov_lambda: float = 0
     max_k_gain: float = 0.0
     
     p_init: float = 0.03
-    value_layer_scale: float = 1
     use_spas: bool = True  
 
     eps_start: float = 0.99
-    eps_end: float = 0.001
-    eps_decay_steps: int = 2500
+    eps_end: float = 0.1
+    eps_decay_steps: int = 3000
 
     warmup_step : int = 0
 
-    update_interval: int = 4
+    update_interval: int = 1
     use_input_norm: bool = True
     use_compile: bool = True
-    plot_interval: int = 50
+    plot_interval: int = 30
     log_interval : int = 1
     seed: int = 0
     
@@ -159,7 +139,7 @@ class Config:
         self.r_inv = 1.0 / (self.r_std ** 2)
         self.tikhonov_sqrt = float(np.sqrt(self.tikhonov_lambda))
         
-        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}_tikhonov{self.tikhonov_lambda}"
+        self.param_str = f"a{self.alpha}_b{self.beta}_r{self.r_std}_p{self.p_init}_q{self.q_std}_buffer{self.buffer_size}_batch{self.batch_size}_horizon{self.N_horizon}_tikhonov{self.tikhonov_lambda}_gamma{self.gamma}"
         self.outdir = f"./results_cartpole/{self.param_str}"
         os.makedirs(self.outdir, exist_ok=True)
 
@@ -176,8 +156,9 @@ parser.add_argument('--horizon', type=int, default=cfg.N_horizon)
 parser.add_argument('--batch', type=int, default=cfg.batch_size)
 parser.add_argument('--q_std', type=float, default=cfg.q_std)
 parser.add_argument('--tau', type=float, default=cfg.tau_srrhuif)
+parser.add_argument('--buffer_size', type=float, default=cfg.buffer_size)
 parser.add_argument('--warmup_step', type=int, default=cfg.warmup_step)
-parser.add_argument('--value_layer_scale', type=float, default=cfg.value_layer_scale) 
+parser.add_argument('--update_interval', type=int, default=cfg.update_interval)
 parser.add_argument('--use_full_eigvalsh', action='store_true', default=cfg.use_full_eigvalsh)
 parser.add_argument('--no_file_log', action='store_true', default=False)
 parser.add_argument('--tikhonov', type=float, default=cfg.tikhonov_lambda)
@@ -190,9 +171,10 @@ cfg.p_init = args.p_init
 cfg.max_episodes = args.episodes
 cfg.N_horizon = args.horizon
 cfg.batch_size = args.batch
+cfg.buffer_size = args.buffer_size
 cfg.q_std = args.q_std
 cfg.tau_srrhuif = args.tau
-cfg.value_layer_scale = args.value_layer_scale
+cfg.update_interval = args.update_interval
 cfg.use_full_eigvalsh = args.use_full_eigvalsh
 cfg.warmup_step = args.warmup_step
 cfg.tikhonov_lambda = args.tikhonov
@@ -777,10 +759,7 @@ def srrhuif_step_nd(theta_current_in, theta_target, neuron_S_info, batch, sp,
 
         S_3d = neuron_S_info[L]
         if is_first or S_3d is None:
-            current_p_init = p_init_val
-            if cfg.value_layer_scale != 1.0 and ('value' in nd_layer['type'] or 'advantage' in nd_layer['type']):
-                current_p_init = p_init_val * cfg.value_layer_scale
-            P_sqrt_prev = np.sqrt(current_p_init) * lc['eye_n_per_batch'].clone()
+            P_sqrt_prev = np.sqrt(p_init_val) * lc['eye_n_per_batch'].clone()
         else:
             P_sqrt_prev = safe_inv_tril_batch(S_3d.permute(2, 0, 1), lc['eye_n_per_batch'])
 
